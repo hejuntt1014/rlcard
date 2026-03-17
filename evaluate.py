@@ -77,18 +77,29 @@ class RandomRuleAgent:
 
 def _run_evaluation(env, dmc_model, opponent_agent, num_games):
     """通用评估：1个DMC vs 3个opponent，DMC轮流坐每个位置
-    队伍计分：payoff ∈ {+2, +1, 0, -1, -2}
+    2v2 计分：payoff ∈ {+2, +1, 0, -1, -2}
       +2 = 大胜（队伍1+2名），+1 = 小胜（1+3名），0 = 平（1+4名）
-      -1 = 小负，-2 = 大负
+    独食 1v3：payoff ∈ {+2, +1, -1, -2}（无平局）
     """
     results = {
-        'win_big': 0,    # payoff = +2
-        'win_small': 0,  # payoff = +1
-        'draw': 0,       # payoff = 0
-        'lose_small': 0, # payoff = -1
-        'lose_big': 0,   # payoff = -2
+        'win_big': 0,       # payoff = +2
+        'win_small': 0,     # payoff = +1
+        'draw': 0,          # payoff = 0
+        'lose_small': 0,    # payoff = -1
+        'lose_big': 0,      # payoff = -2
         'total': 0,
         'total_payoff': 0.0,
+        # 独食局单独统计
+        'solo_total': 0,
+        'solo_wins': 0,     # payoff > 0
+        'solo_losses': 0,   # payoff < 0
+        'solo_payoff': 0.0,
+        # 普通局
+        'normal_total': 0,
+        'normal_wins': 0,
+        'normal_losses': 0,
+        'normal_draws': 0,
+        'normal_payoff': 0.0,
     }
 
     for game_i in range(num_games):
@@ -115,6 +126,22 @@ def _run_evaluation(env, dmc_model, opponent_agent, num_games):
         else:                   results['lose_big'] += 1
         results['total'] += 1
 
+        # 独食局检测
+        is_solo = getattr(getattr(env, 'game', None), 'state', None)
+        is_solo = getattr(is_solo, 'is_solo', False) if is_solo is not None else False
+
+        if is_solo:
+            results['solo_total'] += 1
+            results['solo_payoff'] += dmc_payoff
+            if dmc_payoff > 0:   results['solo_wins'] += 1
+            elif dmc_payoff < 0: results['solo_losses'] += 1
+        else:
+            results['normal_total'] += 1
+            results['normal_payoff'] += dmc_payoff
+            if dmc_payoff > 0:    results['normal_wins'] += 1
+            elif dmc_payoff < 0:  results['normal_losses'] += 1
+            else:                 results['normal_draws'] += 1
+
     return results
 
 
@@ -129,18 +156,20 @@ def evaluate_1v3(env, dmc_model, num_games=100):
 
 
 def evaluate_2v2(env, dmc_model, num_games=100):
-    """2个DMC vs 2个规则AI，交替坐（0,2=DMC, 1,3=规则）"""
+    """2个DMC vs 2个规则AI，覆盖全部6种座位模式消除位置偏差"""
     rule_agent = GreedyRuleAgent()
     results = {'dmc_1st': 0, 'dmc_2nd': 0, 'dmc_3rd': 0, 'dmc_4th': 0, 'total': 0}
 
-    dmc_seats = {0, 2}  # DMC 坐 0 和 2 号位
+    # 6种模式覆盖所有可能的 a3 队伍组合（{0,2}/{1,3}/{0,1}/{2,3}/{0,3}/{1,2}）
+    # 确保两个引擎均等地经历所有座位位置关系
+    dmc_seat_patterns = [
+        {0, 2}, {1, 3},  # 对角线模式
+        {0, 1}, {2, 3},  # 相邻模式
+        {0, 3}, {1, 2},  # 首尾模式
+    ]
 
     for game_i in range(num_games):
-        # 每局交替（偶数局 DMC 坐 0,2；奇数局 DMC 坐 1,3）
-        if game_i % 2 == 1:
-            dmc_seats_this = {1, 3}
-        else:
-            dmc_seats_this = {0, 2}
+        dmc_seats_this = dmc_seat_patterns[game_i % 6]
 
         state, player_id = env.reset()
         while not env.is_over():
@@ -180,17 +209,41 @@ def print_results(results, mode):
     win_rate = wins / total * 100
     avg_payoff = results['total_payoff'] / total
 
+    solo_n   = results['solo_total']
+    normal_n = results['normal_total']
+
     print(f'\n{"="*54}')
     print(f'  评估结果 ({mode}, {total} 局)')
     print(f'{"="*54}')
-    print(f'  大胜(+2): {wb:4d} ({wb/total*100:5.1f}%)  队伍1+2名')
-    print(f'  小胜(+1): {ws:4d} ({ws/total*100:5.1f}%)  队伍1+3名')
-    print(f'  平局( 0): {dr:4d} ({dr/total*100:5.1f}%)  队伍1+4名')
+    print(f'  大胜(+2): {wb:4d} ({wb/total*100:5.1f}%)  2v2:队伍1+2名 / 独食:1st')
+    print(f'  小胜(+1): {ws:4d} ({ws/total*100:5.1f}%)  2v2:队伍1+3名 / 独食:2nd')
+    print(f'  平局( 0): {dr:4d} ({dr/total*100:5.1f}%)  仅2v2:队伍1+4名')
     print(f'  小负(-1): {ls:4d} ({ls/total*100:5.1f}%)')
     print(f'  大负(-2): {lb:4d} ({lb/total*100:5.1f}%)')
     print(f'  ────────────────────────────────────')
-    print(f'  胜率: {win_rate:.1f}%  ({wins}胜 {dr}平 {losses}负)')
+    print(f'  综合胜率: {win_rate:.1f}%  ({wins}胜 {dr}平 {losses}负)')
     print(f'  平均回报: {avg_payoff:+.2f}  (>0=赢, <0=输)')
+
+    # 普通局统计
+    if normal_n > 0:
+        nw = results['normal_wins']
+        nl = results['normal_losses']
+        nd = results['normal_draws']
+        nwr = nw / normal_n * 100
+        navg = results['normal_payoff'] / normal_n
+        print(f'  ────────────────────────────────────')
+        print(f'  普通2v2 ({normal_n}局): {nwr:.1f}%胜率  ({nw}胜 {nd}平 {nl}负)  均值{navg:+.2f}')
+
+    # 独食局统计
+    if solo_n > 0:
+        sw = results['solo_wins']
+        sl = results['solo_losses']
+        swr = sw / solo_n * 100
+        savg = results['solo_payoff'] / solo_n
+        print(f'  独食1v3 ({solo_n}局): {swr:.1f}%胜率  ({sw}胜 {sl}负)  均值{savg:+.2f}')
+    else:
+        print(f'  独食1v3: 未触发（{total}局中无双地主发牌）')
+
     print(f'{"="*54}\n')
 
 
