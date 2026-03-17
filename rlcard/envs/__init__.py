@@ -47,3 +47,8 @@ register(
     env_id='bridge',
     entry_point='rlcard.envs.bridge:BridgeEnv',
 )
+
+register(
+    env_id='a3dizhu',
+    entry_point='rlcard.envs.a3dizhu.env:A3DizhuEnv',
+)
