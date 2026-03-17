@@ -1,19 +1,15 @@
 """
 将 DMC 训练好的模型导出为 ONNX 格式
 
-DMC 有 4 个 agent（每个玩家位置一个），但网络结构完全相同，
-只是权重不同。实际推理时我们只需要一个通用模型（用 player 0 的权重，
-或者取所有位置的平均权重），因为 RL 对局时每个座位的策略应该是对称的。
+支持两种架构：
+  - 旧版：纯 MLP (fc_layers)
+  - 新版：残差网络 (input_proj + res_blocks + output_head)
+
+自动检测 checkpoint 中的架构版本。
 
 ONNX 模型接口：
-  输入: obs_action  shape=[N, 752]  (700维obs + 52维action 拼接)
+  输入: obs_action  shape=[N, 752]  (700维obs + 52维action)
   输出: q_value     shape=[N]       (Q值，越大越好)
-
-Node.js 推理时：
-  1. 构造 obs 向量（700维）
-  2. 对每个合法动作构造 action 向量（52维）
-  3. 拼接 [obs, action] 送入模型
-  4. 取 Q 值最大的动作
 """
 
 import os
@@ -22,26 +18,67 @@ import argparse
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+
+class ResBlockForExport(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.LayerNorm(dim),
+            nn.ReLU(),
+            nn.Linear(dim, dim),
+            nn.LayerNorm(dim),
+        )
+
+    def forward(self, x):
+        return F.relu(x + self.net(x))
 
 
 class DMCNetForExport(nn.Module):
     """导出用的网络，把 obs+action 合并为单一输入"""
 
-    def __init__(self, state_dim, action_dim, mlp_layers=[512, 512, 512, 512, 512]):
+    def __init__(self, state_dim, action_dim, mlp_layers=[512, 512, 512, 512, 512], use_resnet=True):
         super().__init__()
         input_dim = state_dim + action_dim
-        layer_dims = [input_dim] + mlp_layers
-        fc = []
-        for i in range(len(layer_dims)-1):
-            fc.append(nn.Linear(layer_dims[i], layer_dims[i+1]))
-            fc.append(nn.ReLU())
-        fc.append(nn.Linear(layer_dims[-1], 1))
-        self.fc_layers = nn.Sequential(*fc)
+        self.use_resnet = use_resnet
+        hidden = mlp_layers[0]
+
+        if use_resnet:
+            self.input_proj = nn.Sequential(
+                nn.Linear(input_dim, hidden),
+                nn.LayerNorm(hidden),
+                nn.ReLU(),
+            )
+            self.res_blocks = nn.Sequential(
+                *[ResBlockForExport(hidden) for _ in range(len(mlp_layers) - 1)]
+            )
+            self.output_head = nn.Linear(hidden, 1)
+        else:
+            layer_dims = [input_dim] + mlp_layers
+            fc = []
+            for i in range(len(layer_dims)-1):
+                fc.append(nn.Linear(layer_dims[i], layer_dims[i+1]))
+                fc.append(nn.ReLU())
+            fc.append(nn.Linear(layer_dims[-1], 1))
+            self.fc_layers = nn.Sequential(*fc)
 
     def forward(self, obs_action):
-        return self.fc_layers(obs_action).flatten()
+        if self.use_resnet:
+            x = self.input_proj(obs_action)
+            x = self.res_blocks(x)
+            return self.output_head(x).flatten()
+        else:
+            return self.fc_layers(obs_action).flatten()
+
+
+def detect_architecture(state_dict):
+    """自动检测 checkpoint 的网络架构"""
+    has_resblock = any('res_blocks' in k or 'input_proj' in k for k in state_dict.keys())
+    return 'resnet' if has_resblock else 'mlp'
 
 
 def export(model_path, output_path, state_dim=700, action_dim=52, average_weights=True):
@@ -50,25 +87,29 @@ def export(model_path, output_path, state_dim=700, action_dim=52, average_weight
 
     state_dicts = checkpoint['model_state_dict']
     frames = checkpoint.get('frames', 0)
+    shared = checkpoint.get('share_weights', False)
     print(f'  Trained frames: {frames:,}')
     print(f'  Number of agents: {len(state_dicts)}')
+    print(f'  Shared weights: {shared}')
 
-    export_net = DMCNetForExport(state_dim, action_dim)
+    arch = detect_architecture(state_dicts[0])
+    print(f'  Architecture: {arch}')
 
-    if average_weights:
+    use_resnet = (arch == 'resnet')
+    export_net = DMCNetForExport(state_dim, action_dim, use_resnet=use_resnet)
+
+    if shared or not average_weights:
+        export_net.load_state_dict(state_dicts[0])
+        print('  Using agent 0 weights (shared model)')
+    else:
         avg_state = {}
         for key in state_dicts[0]:
-            tensors = [state_dicts[i][key].float()
-                       for i in range(len(state_dicts))]
+            tensors = [state_dicts[i][key].float() for i in range(len(state_dicts))]
             avg_state[key] = torch.mean(torch.stack(tensors), dim=0)
         export_net.load_state_dict(avg_state)
-        print('  Using averaged weights from all 4 agents')
-    else:
-        export_net.load_state_dict(state_dicts[0])
-        print('  Using agent 0 weights')
+        print('  Using averaged weights from all agents')
 
     export_net.eval()
-
     dummy_input = torch.randn(1, state_dim + action_dim)
 
     torch.onnx.export(
@@ -87,15 +128,12 @@ def export(model_path, output_path, state_dim=700, action_dim=52, average_weight
     file_size = os.path.getsize(output_path) / 1024 / 1024
     print(f'\nExported to {output_path} ({file_size:.1f} MB)')
 
-    # 验证 ONNX 模型
     try:
         import onnxruntime as ort
         session = ort.InferenceSession(output_path)
-        test_input = np.random.randn(
-            5, state_dim + action_dim).astype(np.float32)
+        test_input = np.random.randn(5, state_dim + action_dim).astype(np.float32)
         result = session.run(None, {'obs_action': test_input})
-        print(
-            f'ONNX verification: input shape {test_input.shape} -> output shape {result[0].shape}')
+        print(f'ONNX verification: input {test_input.shape} -> output {result[0].shape}')
         print(f'Sample Q values: {result[0]}')
         print('ONNX export verified OK!')
     except ImportError:
@@ -105,10 +143,9 @@ def export(model_path, output_path, state_dim=700, action_dim=52, average_weight
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('Export DMC model to ONNX')
     parser.add_argument('--model_path', type=str,
-                        default='experiments/a3dizhu_v3/model.tar')
+                        default='experiments/dmc_result/a3dizhu_v3/model.tar')
     parser.add_argument('--output', type=str, default='a3dizhu_model.onnx')
     parser.add_argument('--no_average', action='store_true',
-                        help='Use agent 0 weights instead of averaging all 4')
+                        help='Use agent 0 weights instead of averaging')
     args = parser.parse_args()
-
     export(args.model_path, args.output, average_weights=not args.no_average)

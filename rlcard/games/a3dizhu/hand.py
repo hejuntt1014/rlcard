@@ -202,13 +202,18 @@ def _compare_five(a: Hand, b: Hand) -> int:
 
 
 def _compare_primary(a: Hand, b: Hand) -> int:
-    """通过 primary_card 比较大小"""
+    """通过 primary_card 比较大小（必须与 TS HandComparator 完全一致）"""
     if a.type in (STRAIGHT, STRAIGHT_FLUSH) and b.type in (STRAIGHT, STRAIGHT_FLUSH):
-        # 顺子用 STRAIGHT_RANK_VALUE 比较
         ra = STRAIGHT_RANK_VALUE.get(a.primary_card.rank, 0)
         rb = STRAIGHT_RANK_VALUE.get(b.primary_card.rank, 0)
         if ra != rb: return ra - rb
         return SUIT_VALUE[a.primary_card.suit] - SUIT_VALUE[b.primary_card.suit]
+    # 同花: 先比花色(♠>♥>♣>♦), 同花色才比最大牌点数
+    if a.type == FLUSH and b.type == FLUSH:
+        suit_diff = SUIT_VALUE[a.primary_card.suit] - SUIT_VALUE[b.primary_card.suit]
+        if suit_diff != 0:
+            return suit_diff
+        return RANK_VALUE[a.primary_card.rank] - RANK_VALUE[b.primary_card.rank]
     sa = a.primary_card.score()
     sb = b.primary_card.score()
     return sa - sb

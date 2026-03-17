@@ -283,22 +283,12 @@ class GameState:
 
 def compute_payoffs(rankings: list[int], actual_teams: list[str],
                      is_solo: bool, num_players: int = 4) -> list[float]:
-    """按照真实 A3 地主规则计算各玩家回报。
+    """按照真实 A3 地主规则计算各玩家回报（评估用，纯规则分数）。
 
-    排名分: 1st=3, 2nd=2, 3rd=1, 4th=0
-
-    普通 2v2:
-      队伍平均分之差为每人的输赢分
-      例: A队1+2名=(3+2)/2=2.5, B队3+4名=(1+0)/2=0.5, 差=2 → A队每人+2, B队每人-2
-
-    独食 (1v3):
-      独食者1st → 其余各-2, 独食者+6(≈+2×3)
-      独食者2nd → 其余各-1, 独食者+3
-      独食者3rd → 其余各+1, 独食者-3
-      独食者4th → 其余各+2, 独食者-6
-      简化为: 独食者回报 = (3 - solo_rank) × 2 / num_opponents_norm
+    普通 2v2: 队伍平均排名分之差, 范围 [-2, +2]
+    独食 1v3: 按独食者名次, 范围 [-2, +2]
     """
-    rank_points = {0: 3, 1: 2, 2: 1, 3: 0}  # 名次 → 排名分
+    rank_points = {0: 3, 1: 2, 2: 1, 3: 0}
     payoffs = [0.0] * num_players
 
     if is_solo:
@@ -307,30 +297,12 @@ def compute_payoffs(rankings: list[int], actual_teams: list[str],
             return payoffs
 
         solo_rank = rankings.index(solo_idx) if solo_idx in rankings else num_players - 1
-        # 独食者得 1st: 赢2分×3人=+6 → 归一化为+2;  得4th: -6 → 归一化为-2
-        # 使用规则: 1st=+2, 2nd=+1, 3rd=-1, 4th=-2 (per opponent)
-        solo_score_per_opponent = 2 - solo_rank  # 1st→+2, 2nd→+1, 3rd→0... 不对
-
-        # 精确按规则: 1st→其余各输2, 2nd→其余各输1, 3rd→其余各赢1, 4th→其余各赢2
-        if solo_rank == 0:
-            payoffs[solo_idx] = 2.0
-            for i in range(num_players):
-                if i != solo_idx: payoffs[i] = -2.0
-        elif solo_rank == 1:
-            payoffs[solo_idx] = 1.0
-            for i in range(num_players):
-                if i != solo_idx: payoffs[i] = -1.0
-        elif solo_rank == 2:
-            payoffs[solo_idx] = -1.0
-            for i in range(num_players):
-                if i != solo_idx: payoffs[i] = 1.0
-        else:  # 3rd (4th place, 0-indexed rank=3)
-            payoffs[solo_idx] = -2.0
-            for i in range(num_players):
-                if i != solo_idx: payoffs[i] = 2.0
+        solo_payoff_table = {0: 2.0, 1: 1.0, 2: -1.0, 3: -2.0}
+        payoffs[solo_idx] = solo_payoff_table.get(solo_rank, -2.0)
+        for i in range(num_players):
+            if i != solo_idx:
+                payoffs[i] = -payoffs[solo_idx]
     else:
-        # 普通 2v2
-        # 按队伍分组
         team_a_members = [i for i, t in enumerate(actual_teams) if t == TEAM_SPADE_A3]
         team_b_members = [i for i, t in enumerate(actual_teams) if t == TEAM_OPPONENT]
 
@@ -343,14 +315,31 @@ def compute_payoffs(rankings: list[int], actual_teams: list[str],
                 total += rank_points.get(rank, 0)
             return total / len(members)
 
-        avg_a = team_avg(team_a_members)
-        avg_b = team_avg(team_b_members)
-        diff = avg_a - avg_b  # A队视角的分差
-
+        diff = team_avg(team_a_members) - team_avg(team_b_members)
         for i in team_a_members:
             payoffs[i] = diff
         for i in team_b_members:
             payoffs[i] = -diff
+
+    return payoffs
+
+
+# ─── 训练用奖励塑形 ────────────────────────────────────────────────────────
+
+_RANK_BONUS = [0.3, 0.1, -0.1, -0.3]
+
+def compute_training_payoffs(rankings: list[int], actual_teams: list[str],
+                              is_solo: bool, num_players: int = 4) -> list[float]:
+    """带奖励塑形的训练回报。在基础回报上叠加：
+
+    1. 个人排名奖励: 1st→+0.3, 2nd→+0.1, 3rd→-0.1, 4th→-0.3
+       让 AI 有个人出完牌的动力，而非只依赖终局队伍分
+    """
+    payoffs = compute_payoffs(rankings, actual_teams, is_solo, num_players)
+
+    for i in range(num_players):
+        rank = rankings.index(i) if i in rankings else num_players - 1
+        payoffs[i] += _RANK_BONUS[min(rank, 3)]
 
     return payoffs
 

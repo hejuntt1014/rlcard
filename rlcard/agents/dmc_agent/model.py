@@ -1,12 +1,12 @@
 # Copyright 2021 RLCard Team of Texas A&M University
 # Copyright 2021 DouZero Team of Kwai
-# 
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-# 
+#
 #    http://www.apache.org/licenses/LICENSE-2.0
-# 
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -17,66 +17,87 @@ import numpy as np
 
 import torch
 from torch import nn
+import torch.nn.functional as F
+
+
+class ResBlock(nn.Module):
+    """残差块：两层 Linear + LayerNorm，带跳跃连接"""
+    def __init__(self, dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.LayerNorm(dim),
+            nn.ReLU(),
+            nn.Linear(dim, dim),
+            nn.LayerNorm(dim),
+        )
+
+    def forward(self, x):
+        return F.relu(x + self.net(x))
+
 
 class DMCNet(nn.Module):
     def __init__(
         self,
         state_shape,
         action_shape,
-        mlp_layers=[512,512,512,512,512]
+        mlp_layers=[512, 512, 512, 512, 512]
     ):
         super().__init__()
-        input_dim = np.prod(state_shape) + np.prod(action_shape)
-        layer_dims = [input_dim] + mlp_layers
-        fc = []
-        for i in range(len(layer_dims)-1):
-            fc.append(nn.Linear(layer_dims[i], layer_dims[i+1]))
-            fc.append(nn.ReLU())
-        fc.append(nn.Linear(layer_dims[-1], 1))
-        self.fc_layers = nn.Sequential(*fc)
+        input_dim = int(np.prod(state_shape) + np.prod(action_shape))
+        hidden = mlp_layers[0]
+
+        self.input_proj = nn.Sequential(
+            nn.Linear(input_dim, hidden),
+            nn.LayerNorm(hidden),
+            nn.ReLU(),
+        )
+
+        self.res_blocks = nn.Sequential(
+            *[ResBlock(hidden) for _ in range(len(mlp_layers) - 1)]
+        )
+
+        self.output_head = nn.Linear(hidden, 1)
 
     def forward(self, obs, actions):
         obs = torch.flatten(obs, 1)
         actions = torch.flatten(actions, 1)
         x = torch.cat((obs, actions), dim=1)
-        values = self.fc_layers(x).flatten()
-        return values
+        x = self.input_proj(x)
+        x = self.res_blocks(x)
+        return self.output_head(x).flatten()
+
 
 class DMCAgent:
     def __init__(
         self,
         state_shape,
         action_shape,
-        mlp_layers=[512,512,512,512,512],
+        mlp_layers=[512, 512, 512, 512, 512],
         exp_epsilon=0.01,
         device="0",
     ):
         self.use_raw = False
-        self.device = 'cuda:'+device if device != "cpu" else "cpu"
+        self.device = 'cuda:' + device if device != "cpu" else "cpu"
         self.net = DMCNet(state_shape, action_shape, mlp_layers).to(self.device)
         self.exp_epsilon = exp_epsilon
         self.action_shape = action_shape
 
     def step(self, state):
         action_keys, values = self.predict(state)
-
         if self.exp_epsilon > 0 and np.random.rand() < self.exp_epsilon:
             action = np.random.choice(action_keys)
         else:
             action_idx = np.argmax(values)
             action = action_keys[action_idx]
-
         return action
 
     def eval_step(self, state):
         action_keys, values = self.predict(state)
-
         action_idx = np.argmax(values)
         action = action_keys[action_idx]
-
         info = {}
         info['values'] = {state['raw_legal_actions'][i]: float(values[i]) for i in range(len(action_keys))}
-
         return action, info
 
     def share_memory(self):
@@ -89,24 +110,18 @@ class DMCAgent:
         return self.net.parameters()
 
     def predict(self, state):
-        # Prepare obs and actions
         obs = state['obs'].astype(np.float32)
         legal_actions = state['legal_actions']
         action_keys = np.array(list(legal_actions.keys()))
         action_values = list(legal_actions.values())
-        # One-hot encoding if there is no action features
         for i in range(len(action_values)):
             if action_values[i] is None:
                 action_values[i] = np.zeros(self.action_shape[0])
                 action_values[i][action_keys[i]] = 1
         action_values = np.array(action_values, dtype=np.float32)
-
         obs = np.repeat(obs[np.newaxis, :], len(action_keys), axis=0)
-
-        # Predict Q values
         values = self.net.forward(torch.from_numpy(obs).to(self.device),
                                   torch.from_numpy(action_values).to(self.device))
-
         return action_keys, values.cpu().detach().numpy()
 
     def forward(self, obs, actions):
@@ -121,33 +136,52 @@ class DMCAgent:
     def set_device(self, device):
         self.device = device
 
+
 class DMCModel:
+    """DMC 模型容器。
+
+    share_weights=True（默认）时，4 个位置共享同一个网络——
+    A3 地主是位置对称的，无需为每个座位单独训练。
+    """
     def __init__(
         self,
         state_shape,
         action_shape,
-        mlp_layers=[512,512,512,512,512],
+        mlp_layers=[512, 512, 512, 512, 512],
         exp_epsilon=0.01,
-        device=0
+        device=0,
+        share_weights=True,
     ):
-        self.agents = []
-        for player_id in range(len(state_shape)):
+        self.shared = share_weights
+        num_players = len(state_shape)
+
+        if share_weights:
             agent = DMCAgent(
-                state_shape[player_id],
-                action_shape[player_id],
-                mlp_layers,
-                exp_epsilon,
-                device,
+                state_shape[0], action_shape[0],
+                mlp_layers, exp_epsilon, str(device),
             )
-            self.agents.append(agent)
+            self.agents = [agent for _ in range(num_players)]
+        else:
+            self.agents = []
+            for pid in range(num_players):
+                self.agents.append(DMCAgent(
+                    state_shape[pid], action_shape[pid],
+                    mlp_layers, exp_epsilon, str(device),
+                ))
 
     def share_memory(self):
-        for agent in self.agents:
-            agent.share_memory()
+        if self.shared:
+            self.agents[0].share_memory()
+        else:
+            for agent in self.agents:
+                agent.share_memory()
 
     def eval(self):
-        for agent in self.agents:
-            agent.eval()
+        if self.shared:
+            self.agents[0].eval()
+        else:
+            for agent in self.agents:
+                agent.eval()
 
     def parameters(self, index):
         return self.agents[index].parameters()

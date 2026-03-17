@@ -1,24 +1,25 @@
 """
 A3 地主 RLCard 环境接口
 
-状态特征编码（参考 DouZero 的设计）：
+状态特征编码（STATE_DIM = 700 维）：
 
 每个玩家的观测向量包含：
-  [0:52]   - 自己当前手牌（52 维 one-hot）
-  [52:104] - 上一手出牌（52 维，pass=全零）
-  [104:416]- 最近 6 步出牌历史（6 × 52 维，pass=全零）
-  [416:468]- 玩家0已打出的牌（累计，52 维）
-  [468:520]- 玩家1已打出的牌（52 维）
-  [520:572]- 玩家2已打出的牌（52 维）
-  [572:624]- 玩家3已打出的牌（52 维）
-  [624:628]- 各玩家剩余手牌数（4 维，归一化 /13）
-  [628:632]- 队伍 one-hot：[spade_a3, opponent, solo, unknown] × 本玩家
-  [632:636]- 当前玩家是否自由出牌轮（1 维）+ 是否第一手（1 维）+ pass计数/3（1维）+ 填充（1维）
+  [0:52]     - 自己当前手牌（52 维 one-hot）
+  [52:104]   - 上一手出牌（52 维，pass=全零）
+  [104:416]  - 最近 6 步出牌历史（6 × 52 维，pass=全零）
+  [416:624]  - 4 人已打出的牌（4 × 52 维，从完整历史累计）
+  [624:680]  - 4 人剩余手牌数 one-hot（4 × 14 维，0-13 张）
+  [680:696]  - 4 人队伍 one-hot（4 × 4 维：spade_a3/opponent/solo/unknown）
+             ※ 使用逐步暴露的 observed teams，非实际队伍
+  [696:700]  - 杂项（4 维）：自由出牌、是否第一手、pass 计数、已完成人数
 
-总计：636 维（约）
+总计：700 维
 
 动作用 52 维 one-hot 表示（哪些牌被打出），pass=全零。
 DMC 的 action_feature 就是这种格式。
+
+重要：同花(Flush)比较规则 — 先比花色(♠>♥>♣>♦)，同花色才比点数。
+此规则已在 hand.py _compare_primary 中实现，与 TS HandComparator 一致。
 """
 
 from __future__ import annotations
@@ -161,7 +162,9 @@ class A3DizhuEnv(Env):
         return trajectories, payoffs
 
     def get_payoffs(self):
-        return self.game.get_payoffs()
+        from rlcard.games.a3dizhu.game import compute_training_payoffs
+        s = self.game.state
+        return compute_training_payoffs(s.rankings, s.actual_teams, s.is_solo, s.num_players)
 
     def get_perfect_information(self):
         s = self.game.state
