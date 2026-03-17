@@ -143,7 +143,7 @@ def export(model_path, output_path, state_dim=700, action_dim=52, average_weight
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('Export DMC model to ONNX')
     parser.add_argument('--model_path', type=str,
-                        default='experiments/dmc_result/a3dizhu_v3/model.tar')
+                        default='experiments/a3dizhu_v4/model.tar')
     parser.add_argument('--output', type=str, default='a3dizhu_model.onnx')
     parser.add_argument('--no_average', action='store_true',
                         help='Use agent 0 weights instead of averaging')

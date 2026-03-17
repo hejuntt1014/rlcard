@@ -250,7 +250,7 @@ def print_results(results, mode):
 def main():
     parser = argparse.ArgumentParser('A3 地主模型评估')
     parser.add_argument('--model_path', type=str,
-                        default='experiments/a3dizhu_v3/model.tar')
+                        default='experiments/a3dizhu_v4/model.tar')
     parser.add_argument('--num_games', type=int, default=100)
     parser.add_argument('--mode', type=str, default='ladder',
                         choices=['1v3', '2v2', 'both', 'ladder', 'random'])

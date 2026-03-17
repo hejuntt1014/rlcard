@@ -1,12 +1,18 @@
 #!/bin/bash
-# 只用 GPU 0,1,4,5（跳过被 VLLM 占用的 2,3）
+# A3 地主 DMC v4 训练 — 全面重训（修复同花规则 + 残差网络 + 权重共享）
+# GPU 0,1,4,5（跳过被 VLLM 占用的 2,3）
 cd /root/a3dizhu
 
-# 加载已有模型继续训练（如果存在）
+XPID="a3dizhu_v4"
+SAVE_DIR="/root/a3dizhu/experiments"
+
+# v4 是全新训练，不加载旧模型（旧模型规则错误）
 LOAD_FLAG=""
-if [ -f "/root/a3dizhu/experiments/a3dizhu_v3/model.tar" ]; then
+if [ -f "${SAVE_DIR}/${XPID}/model.tar" ]; then
   LOAD_FLAG="--load_model"
-  echo "Found existing model, will continue training."
+  echo "Found existing v4 model, will continue training."
+else
+  echo "Starting fresh v4 training (flush rule fix + ResNet + weight sharing)."
 fi
 
 nohup python3 train_dmc.py \
@@ -14,16 +20,22 @@ nohup python3 train_dmc.py \
   --training_device 0 \
   --num_actor_devices 4 \
   --num_actors 16 \
-  --xpid a3dizhu_v3 \
-  --savedir /root/a3dizhu/experiments \
+  --xpid ${XPID} \
+  --savedir ${SAVE_DIR} \
   --save_interval 15 \
-  --total_frames 1000000000 \
-  --batch_size 32 \
-  --learning_rate 0.0001 \
-  --greedy_ratio 0.10 \
-  --random_ratio 0.05 \
+  --total_frames 5000000000 \
+  --batch_size 128 \
+  --num_buffers 50 \
+  --learning_rate 0.0003 \
+  --min_lr 0.000001 \
+  --unroll_length 60 \
+  --initial_epsilon 0.10 \
+  --final_epsilon 0.01 \
+  --share_weights 1 \
+  --greedy_ratio 0.20 \
+  --random_ratio 0.08 \
   $LOAD_FLAG \
-  > /root/a3dizhu/train.log 2>&1 &
+  > /root/a3dizhu/train_v4.log 2>&1 &
 
-echo "Training started with PID $!"
-echo "Tail log: tail -f /root/a3dizhu/train.log"
+echo "Training v4 started with PID $!"
+echo "Tail log: tail -f /root/a3dizhu/train_v4.log"

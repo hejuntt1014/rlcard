@@ -125,10 +125,12 @@ class A3DizhuEnv(Env):
         return self._extract_state(next_state), next_player_id
 
     def run(self, is_training=False):
-        """覆盖父类 run()，支持混合对手训练。
+        """覆盖父类 run()，支持混合对手训练 + 训练时奖励塑形。
         规则 agent 座位的动作不记录到轨迹中（不用于训练更新）。"""
         if not self._seat_agents:
-            return super().run(is_training=is_training)
+            trajectories, _ = super().run(is_training=is_training)
+            payoffs = self.get_training_payoffs() if is_training else self.get_payoffs()
+            return trajectories, payoffs
 
         trajectories = [[] for _ in range(self.num_players)]
         state, player_id = self.reset()
@@ -158,10 +160,15 @@ class A3DizhuEnv(Env):
             s = self.get_state(pid)
             trajectories[pid].append(s)
 
-        payoffs = self.get_payoffs()
+        payoffs = self.get_training_payoffs() if is_training else self.get_payoffs()
         return trajectories, payoffs
 
     def get_payoffs(self):
+        """原始游戏回报（评估用）"""
+        return self.game.get_payoffs()
+
+    def get_training_payoffs(self):
+        """带奖励塑形的回报（仅训练用）"""
         from rlcard.games.a3dizhu.game import compute_training_payoffs
         s = self.game.state
         return compute_training_payoffs(s.rankings, s.actual_teams, s.is_solo, s.num_players)

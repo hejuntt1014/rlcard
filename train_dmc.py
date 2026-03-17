@@ -89,8 +89,8 @@ if __name__ == '__main__':
     # ─── 训练控制 ──────────────────────────────────
     parser.add_argument('--total_frames', type=int, default=5_000_000_000,
                         help='总帧数 (H100×4 建议 50亿)')
-    parser.add_argument('--batch_size', type=int, default=256,
-                        help='批次大小 (H100 显存充裕，用 256)')
+    parser.add_argument('--batch_size', type=int, default=128,
+                        help='批次大小 (必须 <= num_buffers)')
     parser.add_argument('--unroll_length', type=int, default=60,
                         help='展开长度 (A3地主每局约30-50步)')
     parser.add_argument('--num_buffers', type=int, default=50,
@@ -111,7 +111,7 @@ if __name__ == '__main__':
                         help='权重共享 (1=是, 0=否)')
     parser.add_argument('--load_model', action='store_true',
                         help='加载已有模型继续训练')
-    parser.add_argument('--xpid', type=str, default='a3dizhu_v3',
+    parser.add_argument('--xpid', type=str, default='a3dizhu_v4',
                         help='实验 ID')
     parser.add_argument('--savedir', type=str, default='experiments/dmc_result',
                         help='保存目录')
@@ -126,6 +126,11 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
     args.share_weights = bool(args.share_weights)
+
+    if args.batch_size > args.num_buffers:
+        print(f'[WARNING] batch_size({args.batch_size}) > num_buffers({args.num_buffers}), '
+              f'会导致死锁! 自动调整 num_buffers={args.batch_size + 10}')
+        args.num_buffers = args.batch_size + 10
 
     if args.cuda:
         os.environ['CUDA_VISIBLE_DEVICES'] = args.cuda
