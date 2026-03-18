@@ -25,7 +25,7 @@ nohup python3 train_dmc.py \
   --save_interval 15 \
   --total_frames 5000000000 \
   --batch_size 128 \
-  --num_buffers 50 \
+  --num_buffers 138 \
   --learning_rate 0.0003 \
   --min_lr 0.000001 \
   --unroll_length 60 \
