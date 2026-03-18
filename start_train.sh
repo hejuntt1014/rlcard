@@ -1,5 +1,5 @@
 #!/bin/bash
-# A3 地主 DMC v4 训练 — 全面重训（修复同花规则 + 残差网络 + 权重共享）
+# A3 地主 DMC v4 训练 — 中后期比例调整版（降低弱规则对手混入）
 # GPU 0,1,4,5（跳过被 VLLM 占用的 2,3）
 cd /root/a3dizhu
 
@@ -32,8 +32,8 @@ nohup python3 train_dmc.py \
   --initial_epsilon 0.10 \
   --final_epsilon 0.01 \
   --share_weights 1 \
-  --greedy_ratio 0.20 \
-  --random_ratio 0.08 \
+  --greedy_ratio 0.05 \
+  --random_ratio 0.01 \
   $LOAD_FLAG \
   > /root/a3dizhu/train_v4.log 2>&1 &
 
