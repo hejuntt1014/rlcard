@@ -1,31 +1,32 @@
 #!/bin/bash
-# A3 地主 DMC v4 训练 — 中后期比例调整版（降低弱规则对手混入）
-# GPU 0,1,4,5（跳过被 VLLM 占用的 2,3）
-cd /root/a3dizhu
+# A3 地主 DMC v6 训练
+# v6 改进：报牌阶段支持（AI 可学习是否报牌），STATE_DIM 849→850
 
-XPID="a3dizhu_v4"
-SAVE_DIR="/root/a3dizhu/experiments"
+cd /root/a3dizhu_v6
 
-# v4 是全新训练，不加载旧模型（旧模型规则错误）
+XPID="a3dizhu_v6"
+SAVE_DIR="/root/a3dizhu_v6/experiments"
+
+# v6 是全新训练（状态维度从850D，与v5不兼容，不加载旧模型）
 LOAD_FLAG=""
 if [ -f "${SAVE_DIR}/${XPID}/model.tar" ]; then
   LOAD_FLAG="--load_model"
-  echo "Found existing v4 model, will continue training."
+  echo "Found existing v6 model, will continue training."
 else
-  echo "Starting fresh v4 training (flush rule fix + ResNet + weight sharing)."
+  echo "Starting fresh v6 training (850D state, declare phase support)."
 fi
 
 nohup python3 train_dmc.py \
-  --cuda 0,1,4,5 \
-  --training_device 0 \
-  --num_actor_devices 4 \
-  --num_actors 16 \
+  --cuda 0,1,2,3,4,5 \
+  --training_device 5 \
+  --num_actor_devices 5 \
+  --num_actors 20 \
   --xpid ${XPID} \
   --savedir ${SAVE_DIR} \
   --save_interval 15 \
   --total_frames 5000000000 \
-  --batch_size 128 \
-  --num_buffers 138 \
+  --batch_size 512 \
+  --num_buffers 600 \
   --learning_rate 0.0003 \
   --min_lr 0.000001 \
   --unroll_length 60 \
@@ -35,7 +36,7 @@ nohup python3 train_dmc.py \
   --greedy_ratio 0.05 \
   --random_ratio 0.01 \
   $LOAD_FLAG \
-  > /root/a3dizhu/train_v4.log 2>&1 &
+  > /root/a3dizhu_v6/train_v6.log 2>&1 &
 
-echo "Training v4 started with PID $!"
-echo "Tail log: tail -f /root/a3dizhu/train_v4.log"
+echo "Training v6 started with PID $!"
+echo "Tail log: tail -f /root/a3dizhu_v6/train_v6.log"

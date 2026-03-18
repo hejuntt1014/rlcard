@@ -68,10 +68,17 @@ class GameState:
         pass_count: int,
         is_first_turn: bool,
         rankings: list[int],       # 已完成的玩家索引（按完成顺序）
-        teams: list[str],          # teams[i] = 玩家i队伍（观测用，初始UNKNOWN）
         actual_teams: list[str],   # actual_teams[i] = 实际队伍（发牌时确定）
         is_solo: bool,             # 是否独食局
         num_players: int = 4,
+        spade3_player: int = -1,   # 打出♠3的玩家索引（-1=未打出）
+        spadeA_player: int = -1,   # 打出♠A的玩家索引（-1=未打出）
+        # ── 报牌阶段字段 ──────────────────────────────────────────────────
+        is_declaration_phase: bool = False,  # 是否在报牌阶段
+        declaration_turn: int = 0,           # 当前轮到谁报牌（顺序决策）
+        declaration_passes: int = 0,         # 已 pass 的人数
+        is_declared: bool = False,           # 是否有人报牌
+        declarant: int = -1,                 # 报牌者索引（-1=无人报牌）
     ):
         self.hands = hands
         self.current_player = current_player
@@ -80,10 +87,49 @@ class GameState:
         self.pass_count = pass_count
         self.is_first_turn = is_first_turn
         self.rankings = rankings
-        self.teams = teams
         self.actual_teams = actual_teams
         self.is_solo = is_solo
         self.num_players = num_players
+        self.spade3_player = spade3_player
+        self.spadeA_player = spadeA_player
+        # ── 报牌阶段 ─────────────────────────────────────────────────────
+        self.is_declaration_phase = is_declaration_phase
+        self.declaration_turn = declaration_turn
+        self.declaration_passes = declaration_passes
+        self.is_declared = is_declared
+        self.declarant = declarant
+        # observed teams 从♠牌出牌记录动态计算，确保逻辑唯一真相
+        self.teams = self._compute_observed_teams()
+
+    def _compute_observed_teams(self) -> list[str]:
+        """根据♠3/♠A的出牌历史推断各玩家的可观测队伍。
+
+        与 TS BotContextHelpers.buildPlayedCardsAndTeams() 完全一致：
+        - 同一人打出♠3和♠A → SOLO，其余全是 OPPONENT
+        - 不同人各打一张   → 两人 SPADE_A3，其余 OPPONENT
+        - 仅打出♠3 或 ♠A  → 该人 SPADE_A3，其余 UNKNOWN
+        - 都未打出         → 全部 UNKNOWN
+        """
+        s3, sA = self.spade3_player, self.spadeA_player
+        if s3 >= 0 and sA >= 0:
+            if s3 == sA:
+                # 独食：同一人持有并打出了♠3和♠A
+                teams = [TEAM_OPPONENT] * self.num_players
+                teams[s3] = TEAM_SOLO
+            else:
+                # 两人分别亮牌 → 全局队伍已知，其余必为 OPPONENT
+                teams = [TEAM_OPPONENT] * self.num_players
+                teams[s3] = TEAM_SPADE_A3
+                teams[sA] = TEAM_SPADE_A3
+        elif s3 >= 0:
+            teams = [TEAM_UNKNOWN] * self.num_players
+            teams[s3] = TEAM_SPADE_A3
+        elif sA >= 0:
+            teams = [TEAM_UNKNOWN] * self.num_players
+            teams[sA] = TEAM_SPADE_A3
+        else:
+            teams = [TEAM_UNKNOWN] * self.num_players
+        return teams
 
     def clone(self) -> 'GameState':
         return GameState(
@@ -94,18 +140,33 @@ class GameState:
             pass_count=self.pass_count,
             is_first_turn=self.is_first_turn,
             rankings=list(self.rankings),
-            teams=list(self.teams),
             actual_teams=list(self.actual_teams),
             is_solo=self.is_solo,
             num_players=self.num_players,
+            spade3_player=self.spade3_player,
+            spadeA_player=self.spadeA_player,
+            is_declaration_phase=self.is_declaration_phase,
+            declaration_turn=self.declaration_turn,
+            declaration_passes=self.declaration_passes,
+            is_declared=self.is_declared,
+            declarant=self.declarant,
         )
 
     def is_terminal(self) -> bool:
         """游戏结束条件：
-        1. 只剩 ≤1 名活跃玩家
-        2. 某一队伍的所有成员都已出完
-        3. 独食模式：独食者出完 或 其余3人全出完
+        0. 报牌阶段永远不是终局
+        1. 报牌局：任何人出完即结束（只判断第1名是否为报牌者）
+        2. 只剩 ≤1 名活跃玩家
+        3. 某一队伍的所有成员都已出完
+        4. 独食模式：独食者出完 或 其余3人全出完
         """
+        if self.is_declaration_phase:
+            return False
+
+        # 报牌局：第一个出完牌的人决定输赢，立即结束
+        if self.is_declared and self.declarant >= 0:
+            return len(self.rankings) >= 1
+
         if len(self.rankings) >= self.num_players - 1:
             return True
 
@@ -135,8 +196,14 @@ class GameState:
 
         return False
 
-    def get_legal_moves(self) -> list[Optional[Hand]]:
-        """返回合法出牌列表；None 表示 pass"""
+    def get_legal_moves(self) -> list:
+        """返回合法动作列表。
+        报牌阶段：返回 ['declare', None]（None=不报）
+        出牌阶段：返回 Hand 列表，可能包含 None（pass）
+        """
+        if self.is_declaration_phase:
+            return ['declare', None]  # 'declare'=报牌, None=不报
+
         my_cards = self.hands[self.current_player]
         if not my_cards:
             return []
@@ -157,8 +224,89 @@ class GameState:
             result.append(None)  # 可以 pass
             return result
 
-    def apply_move(self, move: Optional[Hand]) -> 'GameState':
-        """应用出牌，返回新状态"""
+    def apply_declaration(self, declare: bool) -> 'GameState':
+        """处理报牌阶段的单步决策。
+
+        declare=True: 报牌，当前玩家成为 SOLO，报牌阶段结束
+        declare=False: 不报，轮到下一人；全部 pass 后进入出牌阶段
+        """
+        p = self.declaration_turn
+
+        if declare:
+            # 报牌者成为独食，覆盖原有队伍
+            new_actual_teams = [TEAM_OPPONENT] * self.num_players
+            new_actual_teams[p] = TEAM_SOLO
+            return GameState(
+                hands=self.hands,
+                current_player=self.current_player,
+                last_play=None,
+                last_play_player=-1,
+                pass_count=0,
+                is_first_turn=True,
+                rankings=[],
+                actual_teams=new_actual_teams,
+                is_solo=True,
+                num_players=self.num_players,
+                spade3_player=-1,
+                spadeA_player=-1,
+                is_declaration_phase=False,
+                declaration_turn=0,
+                declaration_passes=0,
+                is_declared=True,
+                declarant=p,
+            )
+        else:
+            # 不报，轮到下一人
+            new_passes = self.declaration_passes + 1
+            next_turn = (p + 1) % self.num_players
+            if new_passes >= self.num_players:
+                # 全员 pass → 进入正常出牌阶段
+                return GameState(
+                    hands=self.hands,
+                    current_player=self.current_player,
+                    last_play=None,
+                    last_play_player=-1,
+                    pass_count=0,
+                    is_first_turn=True,
+                    rankings=[],
+                    actual_teams=list(self.actual_teams),
+                    is_solo=self.is_solo,
+                    num_players=self.num_players,
+                    spade3_player=self.spade3_player,
+                    spadeA_player=self.spadeA_player,
+                    is_declaration_phase=False,
+                    declaration_turn=0,
+                    declaration_passes=new_passes,
+                    is_declared=False,
+                    declarant=-1,
+                )
+            return GameState(
+                hands=self.hands,
+                current_player=self.current_player,
+                last_play=None,
+                last_play_player=-1,
+                pass_count=0,
+                is_first_turn=True,
+                rankings=[],
+                actual_teams=list(self.actual_teams),
+                is_solo=self.is_solo,
+                num_players=self.num_players,
+                spade3_player=self.spade3_player,
+                spadeA_player=self.spadeA_player,
+                is_declaration_phase=True,
+                declaration_turn=next_turn,
+                declaration_passes=new_passes,
+                is_declared=False,
+                declarant=-1,
+            )
+
+    def apply_move(self, move) -> 'GameState':
+        """应用动作，返回新状态。
+        报牌阶段: move='declare'(报牌) 或 None(不报)
+        出牌阶段: move=Hand对象(出牌) 或 None(pass)
+        """
+        if self.is_declaration_phase:
+            return self.apply_declaration(move == 'declare')
         if move is None:
             return self._apply_pass()
         return self._apply_play(move)
@@ -191,10 +339,13 @@ class GameState:
                 pass_count=0,
                 is_first_turn=False,
                 rankings=list(self.rankings),
-                teams=self.teams,
                 actual_teams=self.actual_teams,
                 is_solo=self.is_solo,
                 num_players=self.num_players,
+                spade3_player=self.spade3_player,
+                spadeA_player=self.spadeA_player,
+                is_declared=self.is_declared,
+                declarant=self.declarant,
             )
 
         next_player = self._next_active(self.current_player, finished)
@@ -206,10 +357,13 @@ class GameState:
             pass_count=new_pass_count,
             is_first_turn=False,
             rankings=list(self.rankings),
-            teams=self.teams,
             actual_teams=self.actual_teams,
             is_solo=self.is_solo,
             num_players=self.num_players,
+            spade3_player=self.spade3_player,
+            spadeA_player=self.spadeA_player,
+            is_declared=self.is_declared,
+            declarant=self.declarant,
         )
 
     def _apply_play(self, move: Hand) -> 'GameState':
@@ -221,12 +375,14 @@ class GameState:
             else:
                 new_hands.append(hand)
 
-        # 队伍暴露：打出♠3或♠A → 暴露为黑桃A队
-        new_teams = list(self.teams)
+        # 追踪♠3/♠A出牌（正确处理 SOLO：同一人打出两张才标记为独食）
+        new_spade3 = self.spade3_player
+        new_spadeA = self.spadeA_player
         for c in move.cards:
-            if (c.suit == 'spade' and c.rank == '3') or (c.suit == 'spade' and c.rank == 'A'):
-                if new_teams[self.current_player] == TEAM_UNKNOWN:
-                    new_teams[self.current_player] = TEAM_SPADE_A3
+            if c.suit == 'spade' and c.rank == '3':
+                new_spade3 = self.current_player
+            if c.suit == 'spade' and c.rank == 'A':
+                new_spadeA = self.current_player
 
         new_rankings = list(self.rankings)
         if len(new_hands[self.current_player]) == 0:
@@ -241,9 +397,11 @@ class GameState:
             hands=new_hands, current_player=self.current_player,
             last_play=move, last_play_player=self.current_player,
             pass_count=0, is_first_turn=False,
-            rankings=new_rankings, teams=new_teams,
+            rankings=new_rankings,
             actual_teams=self.actual_teams, is_solo=self.is_solo,
             num_players=self.num_players,
+            spade3_player=new_spade3, spadeA_player=new_spadeA,
+            is_declared=self.is_declared, declarant=self.declarant,
         )
         if tmp.is_terminal() and remaining:
             remaining.sort(key=lambda i: len(new_hands[i]), reverse=True)
@@ -261,10 +419,13 @@ class GameState:
             pass_count=0,
             is_first_turn=False,
             rankings=new_rankings,
-            teams=new_teams,
             actual_teams=self.actual_teams,
             is_solo=self.is_solo,
             num_players=self.num_players,
+            spade3_player=new_spade3,
+            spadeA_player=new_spadeA,
+            is_declared=self.is_declared,
+            declarant=self.declarant,
         )
 
     def _next_active(self, from_player: int, finished: set[int]) -> int:
@@ -324,6 +485,30 @@ def compute_payoffs(rankings: list[int], actual_teams: list[str],
     return payoffs
 
 
+# ─── 报牌结算 ──────────────────────────────────────────────────────────────
+
+def compute_declared_payoffs(rankings: list[int], declarant: int,
+                              num_players: int = 4) -> list[float]:
+    """报牌结算：赢第一名 → 声明者 +2.0，其余各 -2/3；否则反向。
+
+    使用与 solo 相同的量纲（最大 ±2.0），保证 Q 值的可比性。
+    实际游戏按 4× 倍率结算，此处为 RL 训练专用缩放。
+    """
+    payoffs = [0.0] * num_players
+    declared_rank = rankings.index(declarant) if declarant in rankings else num_players - 1
+    if declared_rank == 0:
+        payoffs[declarant] = 2.0
+        for i in range(num_players):
+            if i != declarant:
+                payoffs[i] = -2.0 / 3.0
+    else:
+        payoffs[declarant] = -2.0
+        for i in range(num_players):
+            if i != declarant:
+                payoffs[i] = 2.0 / 3.0
+    return payoffs
+
+
 # ─── 训练用奖励塑形 ────────────────────────────────────────────────────────
 
 _RANK_BONUS = [0.3, 0.1, -0.1, -0.3]
@@ -377,8 +562,7 @@ class Game:
 
         # 根据♠3/♠A分配实际队伍（用于计分）
         actual_teams, is_solo = assign_teams(hands)
-        # 观测用队伍：初始 UNKNOWN，打出♠3/♠A时暴露
-        observed_teams = [TEAM_UNKNOWN] * 4
+        # observed_teams 由 GameState._compute_observed_teams() 动态计算
 
         self.state = GameState(
             hands=hands,
@@ -388,22 +572,36 @@ class Game:
             pass_count=0,
             is_first_turn=True,
             rankings=[],
-            teams=observed_teams,
             actual_teams=actual_teams,
             is_solo=is_solo,
             num_players=4,
+            spade3_player=-1,
+            spadeA_player=-1,
+            # 报牌阶段：从座位0开始依次决策
+            is_declaration_phase=True,
+            declaration_turn=0,
+            declaration_passes=0,
+            is_declared=False,
+            declarant=-1,
         )
         self._history = []
 
         return self.get_state(start_player), start_player
 
     def step(self, action):
-        """执行一步动作（action 是 Hand 或 None=pass）"""
+        """执行一步动作。
+        报牌阶段: action='declare' 或 None(不报)
+        出牌阶段: action=Hand 或 None(pass)
+        """
         if self.allow_step_back:
             self._history.append(self.state.clone())
 
         self.state = self.state.apply_move(action)
-        player_id = self.state.current_player
+        # 报牌阶段：current_player 是报牌顺序的当前人
+        if self.state.is_declaration_phase:
+            player_id = self.state.declaration_turn
+        else:
+            player_id = self.state.current_player
         return self.get_state(player_id), player_id
 
     def step_back(self) -> bool:
@@ -430,9 +628,16 @@ class Game:
             'is_solo': s.is_solo,
             'player_id': player_id,
             'legal_actions': s.get_legal_moves(),
+            # 报牌阶段字段
+            'is_declaration_phase': s.is_declaration_phase,
+            'declaration_turn': s.declaration_turn,
+            'is_declared': s.is_declared,
+            'declarant': s.declarant,
         }
 
     def get_player_id(self) -> int:
+        if self.state.is_declaration_phase:
+            return self.state.declaration_turn
         return self.state.current_player
 
     def is_over(self) -> bool:
@@ -441,8 +646,11 @@ class Game:
     def get_payoffs(self) -> list[float]:
         """游戏结束时返回各玩家回报（按照真实 A3 地主规则计分）
 
+        报牌局: 按 compute_declared_payoffs 结算
         普通2v2: 队伍平均排名分之差 (范围 -3 到 +3)
         独食1v3: 独食者1st→+2, 2nd→+1, 3rd→-1, 4th→-2; 其余反向
         """
         s = self.state
+        if s.is_declared and s.declarant >= 0:
+            return compute_declared_payoffs(s.rankings, s.declarant, s.num_players)
         return compute_payoffs(s.rankings, s.actual_teams, s.is_solo, s.num_players)

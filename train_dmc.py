@@ -111,7 +111,7 @@ if __name__ == '__main__':
                         help='权重共享 (1=是, 0=否)')
     parser.add_argument('--load_model', action='store_true',
                         help='加载已有模型继续训练')
-    parser.add_argument('--xpid', type=str, default='a3dizhu_v4',
+    parser.add_argument('--xpid', type=str, default='a3dizhu_v6',
                         help='实验 ID')
     parser.add_argument('--savedir', type=str, default='experiments/dmc_result',
                         help='保存目录')

@@ -38,7 +38,16 @@ class GreedyRuleAgent:
 
     def _decide(self, state: dict):
         raw = state.get('raw_obs', state)
+
+        # 报牌阶段：规则 Agent 不报牌（返回 None = pass_declare）
+        if raw.get('is_declaration_phase', False):
+            return None
+
         legal_actions = raw.get('legal_actions', [])
+        # 过滤掉字符串（'declare'/'pass' 等非 Hand 动作）
+        if isinstance(legal_actions, dict):
+            legal_actions = list(legal_actions.values())
+        legal_actions = [h for h in legal_actions if h is None or hasattr(h, 'cards')]
         if not legal_actions:
             return None
 
@@ -128,7 +137,16 @@ class RandomRuleAgent:
     def step(self, state):
         import random as _rng
         raw = state if 'legal_actions' in state else state.get('raw_obs', state)
+
+        # 报牌阶段：随机决定是否报牌
+        if raw.get('is_declaration_phase', False):
+            return _rng.choice(['declare', None])
+
         legal = raw.get('legal_actions', [])
+        if isinstance(legal, dict):
+            legal = [h for h in legal if h is None or hasattr(h, 'cards')]
+        else:
+            legal = [h for h in legal if h is None or hasattr(h, 'cards')]
         if not legal:
             return None
         return _rng.choice(legal)

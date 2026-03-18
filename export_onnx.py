@@ -8,8 +8,13 @@
 自动检测 checkpoint 中的架构版本。
 
 ONNX 模型接口：
-  输入: obs_action  shape=[N, 752]  (700维obs + 52维action)
+  输入: obs_action  shape=[N, 902]  (850维obs + 52维action)
   输出: q_value     shape=[N]       (Q值，越大越好)
+
+状态维度变更历史：
+  v4: 700维 obs (6步历史，无玩家ID，无is_solo)
+  v5: 849维 obs (8步历史含玩家ID，相对位置编码，is_solo，BUG修复)
+  v6: 850维 obs (新增 is_declaration_phase 位，支持报牌阶段学习)
 """
 
 import os
@@ -81,7 +86,7 @@ def detect_architecture(state_dict):
     return 'resnet' if has_resblock else 'mlp'
 
 
-def export(model_path, output_path, state_dim=700, action_dim=52, average_weights=True):
+def export(model_path, output_path, state_dim=850, action_dim=52, average_weights=True):
     print(f'Loading model from {model_path}')
     checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
 
@@ -143,7 +148,7 @@ def export(model_path, output_path, state_dim=700, action_dim=52, average_weight
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('Export DMC model to ONNX')
     parser.add_argument('--model_path', type=str,
-                        default='experiments/a3dizhu_v4/model.tar')
+                        default='experiments/a3dizhu_v6/model.tar')
     parser.add_argument('--output', type=str, default='a3dizhu_model.onnx')
     parser.add_argument('--no_average', action='store_true',
                         help='Use agent 0 weights instead of averaging')
