@@ -447,7 +447,8 @@ def compute_payoffs(rankings: list[int], actual_teams: list[str],
     """按照真实 A3 地主规则计算各玩家回报（评估用，纯规则分数）。
 
     普通 2v2: 队伍平均排名分之差, 范围 [-2, +2]
-    独食 1v3: 按独食者名次, 范围 [-2, +2]
+    独食 1v3: 独食者 [-2, +2]，每个对手 [-2/3, +2/3]，3:1 零和
+              (规则: 1st→+6/-2, 2nd→+3/-1, 3rd→-3/+1, 4th→-6/+2)
     """
     rank_points = {0: 3, 1: 2, 2: 1, 3: 0}
     payoffs = [0.0] * num_players
@@ -462,7 +463,7 @@ def compute_payoffs(rankings: list[int], actual_teams: list[str],
         payoffs[solo_idx] = solo_payoff_table.get(solo_rank, -2.0)
         for i in range(num_players):
             if i != solo_idx:
-                payoffs[i] = -payoffs[solo_idx]
+                payoffs[i] = -payoffs[solo_idx] / 3.0
     else:
         team_a_members = [i for i, t in enumerate(actual_teams) if t == TEAM_SPADE_A3]
         team_b_members = [i for i, t in enumerate(actual_teams) if t == TEAM_OPPONENT]
@@ -489,23 +490,27 @@ def compute_payoffs(rankings: list[int], actual_teams: list[str],
 
 def compute_declared_payoffs(rankings: list[int], declarant: int,
                               num_players: int = 4) -> list[float]:
-    """报牌结算：赢第一名 → 声明者 +2.0，其余各 -2/3；否则反向。
+    """报牌结算（零和，3:1 比例）。
 
-    使用与 solo 相同的量纲（最大 ±2.0），保证 Q 值的可比性。
-    实际游戏按 4× 倍率结算，此处为 RL 训练专用缩放。
+    真实规则：报牌赢 → 其余三人各输 4分；报牌输 → 报牌者各输 4分。
+    普通局最大 ±2分/人，报牌 = 2× 普通局赌注。
+
+    归一化后：报牌者 ±4.0，每个对手 ∓4/3 ≈ ∓1.333（零和）。
+    对比普通局 ±2.0 / 独食 ±2.0，报牌回报 2× 放大，
+    使 AI 正确学习报牌的高风险高回报特征。
     """
     payoffs = [0.0] * num_players
     declared_rank = rankings.index(declarant) if declarant in rankings else num_players - 1
     if declared_rank == 0:
-        payoffs[declarant] = 2.0
+        payoffs[declarant] = 4.0
         for i in range(num_players):
             if i != declarant:
-                payoffs[i] = -2.0 / 3.0
+                payoffs[i] = -4.0 / 3.0
     else:
-        payoffs[declarant] = -2.0
+        payoffs[declarant] = -4.0
         for i in range(num_players):
             if i != declarant:
-                payoffs[i] = 2.0 / 3.0
+                payoffs[i] = 4.0 / 3.0
     return payoffs
 
 
@@ -527,6 +532,103 @@ def compute_training_payoffs(rankings: list[int], actual_teams: list[str],
         payoffs[i] += _RANK_BONUS[min(rank, 3)]
 
     return payoffs
+
+
+# ─── 中间奖励：队友合作 ───────────────────────────────────────────────────
+
+def get_teammate_confidence(
+    player_id: int,
+    actual_teams: list[str],
+    observed_teams: list[str],
+    num_players: int = 4,
+) -> tuple[Optional[int], float]:
+    """基于 AI 可观测信息判断能否识别队友。
+
+    返回 (actual_teammate_idx, confidence)
+      1.0 = 完全确认队友身份
+      0.5 = 缩小到二选一
+      0.0 = 无法判断 / 无队友（独食）
+    """
+    my_team = actual_teams[player_id]
+
+    if my_team == TEAM_SOLO:
+        return None, 0.0
+
+    # 找到实际队友 (ground truth)
+    actual_teammate = None
+    for i in range(num_players):
+        if i != player_id and actual_teams[i] == my_team:
+            actual_teammate = i
+            break
+    if actual_teammate is None:
+        return None, 0.0
+
+    if my_team == TEAM_SPADE_A3:
+        if observed_teams[actual_teammate] == TEAM_SPADE_A3:
+            return actual_teammate, 1.0
+        return actual_teammate, 0.0
+
+    # OPPONENT 队
+    revealed = [
+        i for i in range(num_players)
+        if i != player_id
+        and observed_teams[i] in (TEAM_SPADE_A3, TEAM_SOLO)
+    ]
+    if len(revealed) >= 2:
+        return actual_teammate, 1.0
+    if len(revealed) == 1:
+        return actual_teammate, 0.5
+    return actual_teammate, 0.0
+
+
+# 保守值：确保一局累积 ≈ ±0.06，仅占终局回报的 ~3%
+_REWARD_LET_TEAMMATE    =  0.015   # 让队友的牌站住 (pass)
+_REWARD_BEAT_TEAMMATE   = -0.01    # 压了队友的牌 (轻微)
+_REWARD_FEED_TEAMMATE   =  0.03    # 出完后队友接风
+
+def compute_step_reward(
+    prev_state: 'GameState',
+    action,
+    new_state: 'GameState',
+    player_id: int,
+) -> float:
+    """计算单步合作中间奖励。
+
+    仅在出牌阶段 + 非独食 + 能识别队友时生效。
+    用 actual_teams 判断行为是否合作，用 observed_teams 的置信度缩放。
+    """
+    if prev_state.is_declaration_phase:
+        return 0.0
+
+    teammate, confidence = get_teammate_confidence(
+        player_id,
+        prev_state.actual_teams,
+        prev_state.teams,
+        prev_state.num_players,
+    )
+    if confidence <= 0.0 or teammate is None:
+        return 0.0
+
+    reward = 0.0
+    last_player = prev_state.last_play_player
+
+    # 行为 1：让牌——pass 让队友的牌站住
+    if action is None and last_player == teammate:
+        reward += _REWARD_LET_TEAMMATE
+
+    # 行为 2：压队友——出牌压了队友刚打出的牌
+    if action is not None and action != 'declare' and last_player == teammate:
+        reward += _REWARD_BEAT_TEAMMATE
+
+    # 行为 3：接风——出完牌后下一个出牌的人是队友
+    if (action is not None
+            and action != 'declare'
+            and hasattr(action, 'cards')
+            and len(new_state.hands[player_id]) == 0
+            and new_state.current_player == teammate):
+        reward += _REWARD_FEED_TEAMMATE
+
+    return reward * confidence
 
 
 class Game:

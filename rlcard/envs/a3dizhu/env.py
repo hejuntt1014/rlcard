@@ -41,7 +41,10 @@ from rlcard.games.a3dizhu import Game
 from rlcard.games.a3dizhu.utils import (
     hand_to_feature, cards_to_feature, NUM_CARDS, ACTION_FEATURE_DIM,
 )
-from rlcard.games.a3dizhu.game import TEAM_SPADE_A3, TEAM_OPPONENT, TEAM_SOLO, TEAM_UNKNOWN
+from rlcard.games.a3dizhu.game import (
+    TEAM_SPADE_A3, TEAM_OPPONENT, TEAM_SOLO, TEAM_UNKNOWN,
+    compute_step_reward,
+)
 
 HISTORY_LEN = 8          # 保留最近 N 步出牌历史（所有玩家加起来）
 HISTORY_STEP_DIM = 4 + 1 + NUM_CARDS  # 玩家(4D 相对) + 是否有效(1D) + 牌面(52D) = 57D
@@ -101,6 +104,7 @@ class A3DizhuEnv(Env):
         self._played_cards = [[] for _ in range(4)]
         self._action_history = []
         self._key_to_hand: dict[str, object] = {}
+        self._step_rewards: list[list[float]] = [[] for _ in range(4)]
 
         self._seat_agents = {}
         for seat in range(4):
@@ -127,6 +131,7 @@ class A3DizhuEnv(Env):
 
         self.timestep += 1
         player_id = self.game.get_player_id()
+        prev_state = self.game.state
 
         # 报牌阶段（declare / pass_declare）不记入出牌历史，只记真实出牌动作
         if not self.game.state.is_declaration_phase:
@@ -137,14 +142,24 @@ class A3DizhuEnv(Env):
             self._played_cards[player_id].extend(action.cards)
 
         next_state, next_player_id = self.game.step(action)
+
+        sr = compute_step_reward(
+            prev_state, action, self.game.state, player_id)
+        self._step_rewards[player_id].append(sr)
+
         return self._extract_state(next_state), next_player_id
 
     def run(self, is_training=False):
-        """覆盖父类 run()，支持混合对手训练 + 训练时奖励塑形。"""
+        """覆盖父类 run()，支持混合对手训练 + 训练时奖励塑形 + 中间奖励。
+
+        返回 (trajectories, payoffs, step_rewards)
+          step_rewards[p] = 玩家 p 每步的中间奖励列表
+        """
         if not self._seat_agents:
             trajectories, _ = super().run(is_training=is_training)
             payoffs = self.get_training_payoffs() if is_training else self.get_payoffs()
-            return trajectories, payoffs
+            step_rewards = [list(sr) for sr in self._step_rewards]
+            return trajectories, payoffs, step_rewards
 
         trajectories = [[] for _ in range(self.num_players)]
         state, player_id = self.reset()
@@ -161,7 +176,8 @@ class A3DizhuEnv(Env):
                     action, _ = self.agents[player_id].eval_step(state)
                 else:
                     action = self.agents[player_id].step(state)
-                next_state, next_player_id = self.step(action, self.agents[player_id].use_raw)
+                next_state, next_player_id = self.step(
+                    action, self.agents[player_id].use_raw)
                 trajectories[player_id].append(action)
 
             state = next_state
@@ -175,7 +191,8 @@ class A3DizhuEnv(Env):
             trajectories[pid].append(s)
 
         payoffs = self.get_training_payoffs() if is_training else self.get_payoffs()
-        return trajectories, payoffs
+        step_rewards = [list(sr) for sr in self._step_rewards]
+        return trajectories, payoffs, step_rewards
 
     def get_payoffs(self):
         """原始游戏回报（评估用）"""
@@ -188,6 +205,36 @@ class A3DizhuEnv(Env):
         if s.is_declared and s.declarant >= 0:
             return compute_declared_payoffs(s.rankings, s.declarant, s.num_players)
         return compute_training_payoffs(s.rankings, s.actual_teams, s.is_solo, s.num_players)
+
+    def get_aux_targets(self):
+        """返回每个玩家的辅助监督标签（预测其他 3 人的队伍）。
+
+        Returns: list of 4 np.ndarray, each shape (3,) dtype int64
+          aux_targets[p][j] = 相对位置 j+1 处玩家的队伍类别
+        类别: 0=SPADE_A3, 1=OPPONENT, 2=SOLO, -1=不可判断(mask)
+
+        mask 逻辑：基于玩家 p 的可观测信息——
+          - p 自己的队伍总是已知的（看自己手牌）
+          - 对于其他人，如果 observed_teams 为 UNKNOWN → 不可判断 → -1
+          - 如果 observed_teams 已暴露（A3/OPPONENT/SOLO）→ 用 actual_teams 监督
+          - 特殊情况：p 知道自己是 A3 队，看到另一人也是 A3 → 可推断剩余人是 OPPONENT
+            （此时 observed_teams 已经不含 UNKNOWN，由 _compute_observed_teams 处理）
+        """
+        _CLS = {TEAM_SPADE_A3: 0, TEAM_OPPONENT: 1, TEAM_SOLO: 2}
+        s = self.game.state
+        actual = s.actual_teams
+        observed = s.teams
+        targets = []
+        for p in range(4):
+            t = np.empty(3, dtype=np.int64)
+            for j in range(3):
+                other = (p + j + 1) % 4
+                if observed[other] == TEAM_UNKNOWN:
+                    t[j] = -1
+                else:
+                    t[j] = _CLS.get(actual[other], 1)
+            targets.append(t)
+        return targets
 
     def get_perfect_information(self):
         s = self.game.state
@@ -297,10 +344,13 @@ class A3DizhuEnv(Env):
         misc = np.zeros(6, dtype=np.int8)
         misc[0] = 1 if raw_state['last_play'] is None else 0       # 自由出牌
         misc[1] = 1 if raw_state['is_first_turn'] else 0            # 第一手
-        misc[2] = min(raw_state.get('pass_count', 0), 3)            # pass计数 (0-3)
-        misc[3] = len(raw_state['rankings'])                        # 已完成玩家数 (0-4)
+        misc[2] = min(raw_state.get('pass_count', 0),
+                      3)            # pass计数 (0-3)
+        # 已完成玩家数 (0-4)
+        misc[3] = len(raw_state['rankings'])
         misc[4] = 1 if raw_state.get('is_solo', False) else 0      # 是否独食局
-        misc[5] = 1 if raw_state.get('is_declaration_phase', False) else 0  # 是否报牌阶段
+        misc[5] = 1 if raw_state.get(
+            'is_declaration_phase', False) else 0  # 是否报牌阶段
         parts.append(misc)
 
         return np.concatenate(parts)

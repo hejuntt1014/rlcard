@@ -63,6 +63,7 @@ def create_buffers(
                 target=dict(size=(T,), dtype=torch.float32),
                 state=dict(size=(T,)+tuple(state_shape[player_id]), dtype=torch.int8),
                 action=dict(size=(T,)+tuple(action_shape[player_id]), dtype=torch.int8),
+                aux_target=dict(size=(T, 3), dtype=torch.int8),
             )
             _buffers = {key: [] for key in specs}
             for _ in range(num_buffers):
@@ -94,6 +95,23 @@ def create_optimizers(
         optimizers.append(optimizer)
     return optimizers
 
+def _compute_targets_with_step_rewards(payoff, step_rewards):
+    """将终局 payoff 与 per-step 中间奖励合并为每步的 target。
+
+    target[t] = payoff + sum(step_rewards[t:])
+
+    这样早期的合作行为能看到更多后续中间奖励的累积，
+    提供比纯终局 payoff 更精细的信用分配信号。
+    """
+    n = len(step_rewards)
+    if n == 0:
+        return []
+    suffix_sum = [0.0] * (n + 1)
+    for t in range(n - 1, -1, -1):
+        suffix_sum[t] = suffix_sum[t + 1] + step_rewards[t]
+    return [payoff + suffix_sum[t] for t in range(n)]
+
+
 def act(
     i,
     device,
@@ -116,25 +134,39 @@ def act(
         target_buf = [[] for _ in range(env.num_players)]
         state_buf = [[] for _ in range(env.num_players)]
         action_buf = [[] for _ in range(env.num_players)]
+        aux_target_buf = [[] for _ in range(env.num_players)]
         size = [0 for _ in range(env.num_players)]
 
         while True:
-            trajectories, payoffs = env.run(is_training=True)
+            trajectories, payoffs, step_rewards = env.run(is_training=True)
+            aux_targets = env.get_aux_targets()
             for p in range(env.num_players):
-                size[p] += len(trajectories[p][:-1]) // 2
+                num_steps = len(trajectories[p][:-1]) // 2
+                size[p] += num_steps
                 diff = size[p] - len(target_buf[p])
                 if diff > 0:
                     done_buf[p].extend([False for _ in range(diff-1)])
                     done_buf[p].append(True)
                     episode_return_buf[p].extend([0.0 for _ in range(diff-1)])
                     episode_return_buf[p].append(float(payoffs[p]))
-                    target_buf[p].extend([float(payoffs[p]) for _ in range(diff)])
-                    # State and action
+
+                    sr = step_rewards[p] if p < len(step_rewards) else []
+                    if len(sr) < diff:
+                        sr = sr + [0.0] * (diff - len(sr))
+                    elif len(sr) > diff:
+                        sr = sr[:diff]
+                    targets = _compute_targets_with_step_rewards(
+                        float(payoffs[p]), sr
+                    )
+                    target_buf[p].extend(targets)
+
+                    at = torch.from_numpy(aux_targets[p])
                     for i in range(0, len(trajectories[p])-2, 2):
                         state = trajectories[p][i]['obs']
                         action = env.get_action_feature(trajectories[p][i+1])
                         state_buf[p].append(torch.from_numpy(state))
                         action_buf[p].append(torch.from_numpy(action))
+                        aux_target_buf[p].append(at)
                 
                 while size[p] > T:
                     index = free_queue[p].get()
@@ -146,12 +178,14 @@ def act(
                         buffers[p]['target'][index][t, ...] = target_buf[p][t]
                         buffers[p]['state'][index][t, ...] = state_buf[p][t]
                         buffers[p]['action'][index][t, ...] = action_buf[p][t]
+                        buffers[p]['aux_target'][index][t, ...] = aux_target_buf[p][t]
                     full_queue[p].put(index)
                     done_buf[p] = done_buf[p][T:]
                     episode_return_buf[p] = episode_return_buf[p][T:]
                     target_buf[p] = target_buf[p][T:]
                     state_buf[p] = state_buf[p][T:]
                     action_buf[p] = action_buf[p][T:]
+                    aux_target_buf[p] = aux_target_buf[p][T:]
                     size[p] -= T
 
     except KeyboardInterrupt:

@@ -59,13 +59,29 @@ class DMCNet(nn.Module):
 
         self.output_head = nn.Linear(hidden, 1)
 
-    def forward(self, obs, actions):
+        # 辅助任务头：预测其他 3 个玩家的队伍（相对位置）
+        # 每人 3 类: SPADE_A3=0, OPPONENT=1, SOLO=2 → 共 9 个 logits
+        self.aux_head = nn.Linear(hidden, 9)
+
+    def _backbone(self, obs, actions):
         obs = torch.flatten(obs, 1)
         actions = torch.flatten(actions, 1)
         x = torch.cat((obs, actions), dim=1)
         x = self.input_proj(x)
         x = self.res_blocks(x)
+        return x
+
+    def forward(self, obs, actions):
+        """Q 值输出（推理 / ONNX 导出用，不走 aux_head）"""
+        x = self._backbone(obs, actions)
         return self.output_head(x).flatten()
+
+    def forward_with_aux(self, obs, actions):
+        """训练用：同时返回 Q 值和辅助预测 logits"""
+        x = self._backbone(obs, actions)
+        q = self.output_head(x).flatten()
+        aux = self.aux_head(x)          # (batch, 9)
+        return q, aux
 
 
 class DMCAgent:
@@ -126,6 +142,9 @@ class DMCAgent:
 
     def forward(self, obs, actions):
         return self.net.forward(obs, actions)
+
+    def forward_with_aux(self, obs, actions):
+        return self.net.forward_with_aux(obs, actions)
 
     def load_state_dict(self, state_dict):
         return self.net.load_state_dict(state_dict)

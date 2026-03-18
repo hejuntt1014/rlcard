@@ -8,8 +8,9 @@
 自动检测 checkpoint 中的架构版本。
 
 ONNX 模型接口：
-  输入: obs_action  shape=[N, 902]  (850维obs + 52维action)
-  输出: q_value     shape=[N]       (Q值，越大越好)
+  输入: obs_action   shape=[N, 902]   (850维obs + 52维action)
+  输出1: q_value     shape=[N]        (Q值，越大越好)
+  输出2: aux_logits  shape=[N, 9]     (3名其他玩家的队伍预测 logits)
 
 状态维度变更历史：
   v4: 700维 obs (6步历史，无玩家ID，无is_solo)
@@ -46,10 +47,18 @@ class ResBlockForExport(nn.Module):
 class DMCNetForExport(nn.Module):
     """导出用的网络，把 obs+action 合并为单一输入"""
 
-    def __init__(self, state_dim, action_dim, mlp_layers=[512, 512, 512, 512, 512], use_resnet=True):
+    def __init__(
+        self,
+        state_dim,
+        action_dim,
+        mlp_layers=[512, 512, 512, 512, 512],
+        use_resnet=True,
+        use_aux_head=True,
+    ):
         super().__init__()
         input_dim = state_dim + action_dim
         self.use_resnet = use_resnet
+        self.use_aux_head = use_aux_head and use_resnet
         hidden = mlp_layers[0]
 
         if use_resnet:
@@ -62,6 +71,8 @@ class DMCNetForExport(nn.Module):
                 *[ResBlockForExport(hidden) for _ in range(len(mlp_layers) - 1)]
             )
             self.output_head = nn.Linear(hidden, 1)
+            if self.use_aux_head:
+                self.aux_head = nn.Linear(hidden, 9)
         else:
             layer_dims = [input_dim] + mlp_layers
             fc = []
@@ -75,9 +86,13 @@ class DMCNetForExport(nn.Module):
         if self.use_resnet:
             x = self.input_proj(obs_action)
             x = self.res_blocks(x)
-            return self.output_head(x).flatten()
-        else:
-            return self.fc_layers(obs_action).flatten()
+            q = self.output_head(x).flatten()
+            aux = self.aux_head(x) if self.use_aux_head else torch.zeros((x.shape[0], 9), dtype=x.dtype, device=x.device)
+            return q, aux
+
+        q = self.fc_layers(obs_action).flatten()
+        aux = torch.zeros((obs_action.shape[0], 9), dtype=obs_action.dtype, device=obs_action.device)
+        return q, aux
 
 
 def detect_architecture(state_dict):
@@ -98,21 +113,32 @@ def export(model_path, output_path, state_dim=850, action_dim=52, average_weight
     print(f'  Shared weights: {shared}')
 
     arch = detect_architecture(state_dicts[0])
+    has_aux_head = any('aux_head' in k for k in state_dicts[0].keys())
     print(f'  Architecture: {arch}')
+    print(f'  Aux head: {"yes" if has_aux_head else "no (export zeros)"}')
 
     use_resnet = (arch == 'resnet')
-    export_net = DMCNetForExport(state_dim, action_dim, use_resnet=use_resnet)
+    export_net = DMCNetForExport(
+        state_dim,
+        action_dim,
+        use_resnet=use_resnet,
+        use_aux_head=has_aux_head,
+    )
 
     if shared or not average_weights:
-        export_net.load_state_dict(state_dicts[0])
+        missing, unexpected = export_net.load_state_dict(state_dicts[0], strict=False)
         print('  Using agent 0 weights (shared model)')
     else:
         avg_state = {}
         for key in state_dicts[0]:
             tensors = [state_dicts[i][key].float() for i in range(len(state_dicts))]
             avg_state[key] = torch.mean(torch.stack(tensors), dim=0)
-        export_net.load_state_dict(avg_state)
+        missing, unexpected = export_net.load_state_dict(avg_state, strict=False)
         print('  Using averaged weights from all agents')
+    if missing:
+        print(f'  Missing keys during export load: {missing}')
+    if unexpected:
+        print(f'  Unexpected keys during export load: {unexpected}')
 
     export_net.eval()
     dummy_input = torch.randn(1, state_dim + action_dim)
@@ -122,10 +148,11 @@ def export(model_path, output_path, state_dim=850, action_dim=52, average_weight
         dummy_input,
         output_path,
         input_names=['obs_action'],
-        output_names=['q_value'],
+        output_names=['q_value', 'aux_logits'],
         dynamic_axes={
             'obs_action': {0: 'batch_size'},
             'q_value': {0: 'batch_size'},
+            'aux_logits': {0: 'batch_size'},
         },
         opset_version=17,
     )
@@ -138,8 +165,9 @@ def export(model_path, output_path, state_dim=850, action_dim=52, average_weight
         session = ort.InferenceSession(output_path)
         test_input = np.random.randn(5, state_dim + action_dim).astype(np.float32)
         result = session.run(None, {'obs_action': test_input})
-        print(f'ONNX verification: input {test_input.shape} -> output {result[0].shape}')
+        print(f'ONNX verification: input {test_input.shape} -> q {result[0].shape}, aux {result[1].shape}')
         print(f'Sample Q values: {result[0]}')
+        print(f'Sample aux logits[0]: {result[1][0]}')
         print('ONNX export verified OK!')
     except ImportError:
         print('onnxruntime not installed, skipping verification')

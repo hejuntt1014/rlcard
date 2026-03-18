@@ -40,6 +40,10 @@ from .pettingzoo_utils import (
     act_pettingzoo,
 )
 
+import torch.nn.functional as F
+
+AUX_LOSS_WEIGHT = 0.1
+
 def compute_loss(logits, targets):
     loss = ((logits - targets)**2).mean()
     return loss
@@ -60,12 +64,29 @@ def learn(
     state = torch.flatten(batch['state'].to(device), 0, 1).float()
     action = torch.flatten(batch['action'].to(device), 0, 1).float()
     target = torch.flatten(batch['target'].to(device), 0, 1)
+    aux_target = torch.flatten(batch['aux_target'].to(device), 0, 1).long()
     episode_returns = batch['episode_return'][batch['done']]
     mean_episode_return_buf[position].append(torch.mean(episode_returns).to(device))
 
     with lock:
-        values = agent.forward(state, action)
-        loss = compute_loss(values, target)
+        values, aux_logits = agent.forward_with_aux(state, action)
+        q_loss = compute_loss(values, target)
+
+        aux_loss = torch.tensor(0.0, device=device)
+        aux_count = 0
+        for i in range(3):
+            mask = aux_target[:, i] >= 0
+            if mask.any():
+                aux_loss += F.cross_entropy(
+                    aux_logits[:, i*3:(i+1)*3][mask],
+                    aux_target[:, i][mask],
+                )
+                aux_count += 1
+        if aux_count > 0:
+            aux_loss = aux_loss / aux_count
+
+        loss = q_loss + AUX_LOSS_WEIGHT * aux_loss
+
         stats = {
             'mean_episode_return_'+str(position): torch.mean(torch.stack([_r for _r in mean_episode_return_buf[position]])).item(),
             'loss_'+str(position): loss.item(),
