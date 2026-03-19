@@ -19,14 +19,15 @@ fi
 nohup python3 train_dmc.py \
   --cuda 0,1,2,3,4,5 \
   --training_device 5 \
-  --num_actor_devices 5 \
+  --num_actor_devices 6 \
   --num_actors 20 \
+  --num_threads 1 \
   --xpid ${XPID} \
   --savedir ${SAVE_DIR} \
   --save_interval 15 \
   --total_frames 5000000000 \
-  --batch_size 512 \
-  --num_buffers 600 \
+  --batch_size 128 \
+  --num_buffers 200 \
   --learning_rate 0.0003 \
   --min_lr 0.000001 \
   --unroll_length 60 \

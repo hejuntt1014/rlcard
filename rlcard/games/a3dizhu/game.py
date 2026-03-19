@@ -105,11 +105,16 @@ class GameState:
         """根据♠3/♠A的出牌历史推断各玩家的可观测队伍。
 
         与 TS BotContextHelpers.buildPlayedCardsAndTeams() 完全一致：
+        - 报牌局：报牌者 SOLO，其余 OPPONENT（报牌是公开信息）
         - 同一人打出♠3和♠A → SOLO，其余全是 OPPONENT
         - 不同人各打一张   → 两人 SPADE_A3，其余 OPPONENT
         - 仅打出♠3 或 ♠A  → 该人 SPADE_A3，其余 UNKNOWN
         - 都未打出         → 全部 UNKNOWN
         """
+        if self.is_declared and self.declarant >= 0:
+            teams = [TEAM_OPPONENT] * self.num_players
+            teams[self.declarant] = TEAM_SOLO
+            return teams
         s3, sA = self.spade3_player, self.spadeA_player
         if s3 >= 0 and sA >= 0:
             if s3 == sA:

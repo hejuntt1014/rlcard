@@ -40,6 +40,7 @@ def train(args):
     print(f'  ────────────────────────────')
     print(f'  权重共享: {"是 (4位置→1网络)" if args.share_weights else "否 (4独立网络)"}')
     print(f'  Actors:   {args.num_actors}/device × {args.num_actor_devices} devices')
+    print(f'  Threads:  {args.num_threads}/device/position')
     print(f'  Batch:    {args.batch_size}')
     print(f'  LR:       {args.learning_rate} → {args.min_lr} (cosine)')
     print(f'  Epsilon:  {args.initial_epsilon} → {args.final_epsilon} (linear)')
@@ -64,6 +65,7 @@ def train(args):
         learning_rate=args.learning_rate,
         unroll_length=args.unroll_length,
         num_buffers=args.num_buffers,
+        num_threads=args.num_threads,
         share_weights=args.share_weights,
         initial_epsilon=args.initial_epsilon,
         final_epsilon=args.final_epsilon,
@@ -84,11 +86,13 @@ if __name__ == '__main__':
     parser.add_argument('--num_actor_devices', type=int, default=1,
                         help='模拟用 GPU 数量')
     parser.add_argument('--num_actors', type=int, default=24,
-                        help='每 GPU 的 Actor 数 (H100 建议 24-48)')
+                        help='每 GPU 的 Actor 数')
+    parser.add_argument('--num_threads', type=int, default=4,
+                        help='每设备每位置的 learner 线程数')
 
     # ─── 训练控制 ──────────────────────────────────
     parser.add_argument('--total_frames', type=int, default=5_000_000_000,
-                        help='总帧数 (H100×4 建议 50亿)')
+                        help='总帧数')
     parser.add_argument('--batch_size', type=int, default=128,
                         help='批次大小 (必须 <= num_buffers)')
     parser.add_argument('--unroll_length', type=int, default=60,
