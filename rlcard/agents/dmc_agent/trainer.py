@@ -92,11 +92,6 @@ def learn(
 
         loss = q_loss + AUX_LOSS_WEIGHT * aux_loss
 
-        stats = {
-            'mean_episode_return_'+str(position): torch.mean(torch.stack([_r for _r in mean_episode_return_buf[position]])).item(),
-            'loss_'+str(position): loss.item(),
-        }
-
         optimizer.zero_grad()
         loss.backward()
         nn.utils.clip_grad_norm_(agent.parameters(), max_grad_norm)
@@ -105,7 +100,7 @@ def learn(
         if sync_weights:
             for actor_model in actor_models.values():
                 actor_model.get_agent(position).load_state_dict(agent.state_dict())
-        return stats
+        return loss.detach()
 
 
 class DMCTrainer:
@@ -357,7 +352,7 @@ class DMCTrainer:
                     buffers[device][position],
                     self.B, local_lock
                 )
-                _stats = learn(
+                loss_val = learn(
                     position, models,
                     learner_model.get_agent(position),
                     batch, optimizers[position],
@@ -366,8 +361,11 @@ class DMCTrainer:
                 )
 
                 with lock:
-                    for k in _stats:
-                        stats[k] = _stats[k]
+                    stats['loss_'+str(position)] = loss_val.item()
+                    buf = self.mean_episode_return_buf[position]
+                    if len(buf) > 0:
+                        stats['mean_episode_return_'+str(position)] = torch.mean(
+                            torch.stack(list(buf))).item()
 
                     if self.share_weights and position == 0:
                         scheduler.step()
@@ -385,7 +383,7 @@ class DMCTrainer:
         threads = []
 
         if self.share_weights and not self.is_pettingzoo_env:
-            weight_sync_interval = 10
+            weight_sync_interval = 50
 
             def aggregated_learner(stats_lock=threading.Lock()):
                 nonlocal frames, stats
@@ -397,7 +395,8 @@ class DMCTrainer:
                 _diag_skipped = 0
                 _diag_get_ms = 0.0
                 _diag_learn_ms = 0.0
-                _diag_sync_ms = 0.0
+                _loss_accum = {p: [] for p in range(self.num_players)}
+                _stats_interval = 50
 
                 while frames < self.total_frames:
                     trained_any = False
@@ -418,7 +417,7 @@ class DMCTrainer:
 
                         do_sync = (step_count % weight_sync_interval == 0)
                         _lt0 = time.time()
-                        _stats = learn(
+                        loss_val = learn(
                             position, models,
                             learner_model.get_agent(position),
                             batch, optimizers[position],
@@ -429,21 +428,29 @@ class DMCTrainer:
                         )
                         _lt1 = time.time()
                         _diag_learn_ms += (_lt1 - _lt0) * 1000
-                        if do_sync:
-                            _diag_sync_ms += (_lt1 - _lt0) * 1000
                         step_count += 1
                         _diag_trained += 1
                         trained_any = True
+                        _loss_accum[position].append(loss_val)
 
+                        do_stats = (step_count % _stats_interval == 0)
                         with stats_lock:
-                            for k in _stats:
-                                stats[k] = _stats[k]
+                            if do_stats:
+                                for p in range(self.num_players):
+                                    if _loss_accum[p]:
+                                        stats['loss_'+str(p)] = torch.stack(_loss_accum[p]).mean().item()
+                                        _loss_accum[p] = []
+                                    buf = self.mean_episode_return_buf[p]
+                                    if len(buf) > 0:
+                                        stats['mean_episode_return_'+str(p)] = torch.mean(
+                                            torch.stack(list(buf))).item()
                             if position == 0:
                                 scheduler.step()
-                            to_log = dict(frames=frames)
-                            to_log.update({k: stats[k] for k in stat_keys})
-                            self.plogger.log(to_log)
                             frames += self.T * self.B
+                            if do_stats:
+                                to_log = dict(frames=frames)
+                                to_log.update({k: stats[k] for k in stat_keys})
+                                self.plogger.log(to_log)
 
                     if not trained_any:
                         time.sleep(0.001)
@@ -459,7 +466,7 @@ class DMCTrainer:
                             _diag_trained / (time.time() - _diag_t))
                         _diag_t = time.time()
                         _diag_trained = _diag_skipped = 0
-                        _diag_get_ms = _diag_learn_ms = _diag_sync_ms = 0.0
+                        _diag_get_ms = _diag_learn_ms = 0.0
 
             thread = threading.Thread(
                 target=aggregated_learner,

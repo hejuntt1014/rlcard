@@ -25,10 +25,10 @@ nohup python3 train_dmc.py \
   --num_threads 1 \
   --xpid ${XPID} \
   --savedir ${SAVE_DIR} \
-  --save_interval 15 \
+  --save_interval 5 \
   --total_frames 5000000000 \
-  --batch_size 8 \
-  --num_buffers 200 \
+  --batch_size 256 \
+  --num_buffers 500 \
   --learning_rate 0.0003 \
   --min_lr 0.000001 \
   --unroll_length 60 \
