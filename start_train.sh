@@ -21,13 +21,13 @@ nohup python3 train_dmc.py \
   --cuda 0,1,2,3,4,5 \
   --training_device 5 \
   --num_actor_devices 5 \
-  --num_actors 2 \
+  --num_actors 3 \
   --num_threads 1 \
   --xpid ${XPID} \
   --savedir ${SAVE_DIR} \
   --save_interval 15 \
   --total_frames 5000000000 \
-  --batch_size 128 \
+  --batch_size 8 \
   --num_buffers 200 \
   --learning_rate 0.0003 \
   --min_lr 0.000001 \
@@ -43,5 +43,5 @@ nohup python3 train_dmc.py \
   > /root/a3dizhu_v6/train_v6.log 2>&1 &
 
 echo "Training v6 started with PID $!"
-echo "  Actors: 2/device × 5 devices = 10 processes × 200 envs = 2000 concurrent games"
+echo "  Actors: 3/device × 5 devices = 15 processes × 200 envs = 3000 concurrent games"
 echo "Tail log: tail -f /root/a3dizhu_v6/train_v6.log"

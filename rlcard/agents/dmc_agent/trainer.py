@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import os
 import threading
 import time
@@ -30,6 +31,7 @@ from .model import DMCModel
 from .pettingzoo_model import DMCModelPettingZoo
 from .utils import (
     get_batch,
+    get_batch_nonblocking,
     create_buffers,
     create_optimizers,
     act,
@@ -58,7 +60,8 @@ def learn(
     training_device,
     max_grad_norm,
     mean_episode_return_buf,
-    lock
+    lock=None,
+    sync_weights=True,
 ):
     """Performs a learning (optimization) step."""
     device = "cuda:"+str(training_device) if training_device != "cpu" else "cpu"
@@ -69,7 +72,8 @@ def learn(
     episode_returns = batch['episode_return'][batch['done']]
     mean_episode_return_buf[position].append(torch.mean(episode_returns).to(device))
 
-    with lock:
+    ctx = lock if lock is not None else contextlib.nullcontext()
+    with ctx:
         values, aux_logits = agent.forward_with_aux(state, action)
         q_loss = compute_loss(values, target)
 
@@ -98,8 +102,9 @@ def learn(
         nn.utils.clip_grad_norm_(agent.parameters(), max_grad_norm)
         optimizer.step()
 
-        for actor_model in actor_models.values():
-            actor_model.get_agent(position).load_state_dict(agent.state_dict())
+        if sync_weights:
+            for actor_model in actor_models.values():
+                actor_model.get_agent(position).load_state_dict(agent.state_dict())
         return stats
 
 
@@ -378,17 +383,104 @@ class DMCTrainer:
                     free_queue[device][p].put(m)
 
         threads = []
-        locks = {device: [threading.Lock() for _ in range(self.num_players)] for device in self.device_iterator}
 
-        for device in self.device_iterator:
-            for i in range(self.num_threads):
-                for position in range(self.num_players):
-                    thread = threading.Thread(
-                        target=batch_and_learn,
-                        name='batch-and-learn-%d' % i,
-                        args=(i, device, position, locks[device][position], position_locks[position]))
-                    thread.start()
-                    threads.append(thread)
+        if self.share_weights and not self.is_pettingzoo_env:
+            weight_sync_interval = 10
+
+            def aggregated_learner(stats_lock=threading.Lock()):
+                nonlocal frames, stats
+                pairs = [(d, p) for d in self.device_iterator
+                         for p in range(self.num_players)]
+                step_count = 0
+                _diag_t = time.time()
+                _diag_trained = 0
+                _diag_skipped = 0
+                _diag_get_ms = 0.0
+                _diag_learn_ms = 0.0
+                _diag_sync_ms = 0.0
+
+                while frames < self.total_frames:
+                    trained_any = False
+                    for device, position in pairs:
+                        _gt0 = time.time()
+                        batch = get_batch_nonblocking(
+                            free_queue[device][position],
+                            full_queue[device][position],
+                            buffers[device][position],
+                            self.B,
+                        )
+                        _gt1 = time.time()
+                        _diag_get_ms += (_gt1 - _gt0) * 1000
+
+                        if batch is None:
+                            _diag_skipped += 1
+                            continue
+
+                        do_sync = (step_count % weight_sync_interval == 0)
+                        _lt0 = time.time()
+                        _stats = learn(
+                            position, models,
+                            learner_model.get_agent(position),
+                            batch, optimizers[position],
+                            self.training_device, self.max_grad_norm,
+                            self.mean_episode_return_buf,
+                            lock=None,
+                            sync_weights=do_sync,
+                        )
+                        _lt1 = time.time()
+                        _diag_learn_ms += (_lt1 - _lt0) * 1000
+                        if do_sync:
+                            _diag_sync_ms += (_lt1 - _lt0) * 1000
+                        step_count += 1
+                        _diag_trained += 1
+                        trained_any = True
+
+                        with stats_lock:
+                            for k in _stats:
+                                stats[k] = _stats[k]
+                            if position == 0:
+                                scheduler.step()
+                            to_log = dict(frames=frames)
+                            to_log.update({k: stats[k] for k in stat_keys})
+                            self.plogger.log(to_log)
+                            frames += self.T * self.B
+
+                    if not trained_any:
+                        time.sleep(0.001)
+
+                    if time.time() - _diag_t > 30.0 and _diag_trained > 0:
+                        log.info(
+                            'Learner diag: trained=%d skipped=%d | '
+                            'get_avg=%.2fms learn_avg=%.2fms | '
+                            'batches/sec=%.1f',
+                            _diag_trained, _diag_skipped,
+                            _diag_get_ms / _diag_trained,
+                            _diag_learn_ms / _diag_trained,
+                            _diag_trained / (time.time() - _diag_t))
+                        _diag_t = time.time()
+                        _diag_trained = _diag_skipped = 0
+                        _diag_get_ms = _diag_learn_ms = _diag_sync_ms = 0.0
+
+            thread = threading.Thread(
+                target=aggregated_learner,
+                name='aggregated-learner',
+            )
+            thread.start()
+            threads.append(thread)
+        else:
+            locks = {device: [threading.Lock() for _ in range(self.num_players)]
+                     for device in self.device_iterator}
+            for device in self.device_iterator:
+                for i in range(self.num_threads):
+                    for position in range(self.num_players):
+                        thread = threading.Thread(
+                            target=batch_and_learn,
+                            name='batch-and-learn-%d' % i,
+                            args=(i, device, position,
+                                  locks[device][position],
+                                  position_locks[position]))
+                        thread.start()
+                        threads.append(thread)
 
         def checkpoint(frames):
             log.info('Saving checkpoint to %s', self.checkpointpath)

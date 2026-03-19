@@ -47,6 +47,29 @@ def get_batch(
         free_queue.put(m)
     return batch
 
+def get_batch_nonblocking(free_queue, full_queue, buffers, batch_size):
+    """Non-blocking variant: returns batch dict or None if < batch_size items.
+
+    All poll() calls use timeout=0 (instant) to avoid stalling.
+    """
+    if not full_queue._reader.poll(0):
+        return None
+    indices = []
+    for _ in range(batch_size):
+        if not full_queue._reader.poll(0):
+            for idx in indices:
+                full_queue.put(idx)
+            return None
+        indices.append(full_queue.get())
+    batch = {
+        key: torch.stack([buffers[key][m] for m in indices], dim=1)
+        for key in buffers
+    }
+    for m in indices:
+        free_queue.put(m)
+    return batch
+
+
 def create_buffers(
     T,
     num_buffers,
@@ -69,10 +92,7 @@ def create_buffers(
             _buffers = {key: [] for key in specs}
             for _ in range(num_buffers):
                 for key in _buffers:
-                    if device == "cpu":
-                        _buffer = torch.empty(**specs[key]).to('cpu').share_memory_()
-                    else:
-                        _buffer = torch.empty(**specs[key]).to('cuda:'+str(device)).share_memory_()
+                    _buffer = torch.empty(**specs[key]).share_memory_()
                     _buffers[key].append(_buffer)
             buffers[device].append(_buffers)
     return buffers
