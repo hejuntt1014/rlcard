@@ -33,11 +33,20 @@ def train(args):
         'random_ratio': args.random_ratio,
     })
 
+    total_actors = args.num_actors * args.num_actor_devices
+    if args.vectorized:
+        total_envs = total_actors * args.envs_per_actor
+        mode_str = f'向量化 ({args.envs_per_actor} envs/actor, {total_envs} total)'
+    else:
+        total_envs = total_actors
+        mode_str = f'经典 (1 env/actor, {total_envs} total)'
+
     print(f'[A3 地主 DMC 训练 — 增强版]')
     print(f'  状态维度: {env.state_shape}')
     print(f'  动作维度: {env.action_shape}')
     print(f'  玩家数量: {env.num_players}')
     print(f'  ────────────────────────────')
+    print(f'  Actor 模式: {mode_str}')
     print(f'  权重共享: {"是 (4位置→1网络)" if args.share_weights else "否 (4独立网络)"}')
     print(f'  Actors:   {args.num_actors}/device × {args.num_actor_devices} devices')
     print(f'  Threads:  {args.num_threads}/device/position')
@@ -70,6 +79,8 @@ def train(args):
         initial_epsilon=args.initial_epsilon,
         final_epsilon=args.final_epsilon,
         min_lr=args.min_lr,
+        vectorized=args.vectorized,
+        envs_per_actor=args.envs_per_actor,
     )
 
     trainer.start()
@@ -122,6 +133,12 @@ if __name__ == '__main__':
     parser.add_argument('--save_interval', type=int, default=15,
                         help='保存间隔（分钟）')
 
+    # ─── 向量化环境 ─────────────────────────────────
+    parser.add_argument('--vectorized', type=int, default=1,
+                        help='向量化 Actor (1=是, 0=否; 默认开启)')
+    parser.add_argument('--envs_per_actor', type=int, default=200,
+                        help='每个 Actor 进程管理的 C++ 环境数')
+
     # ─── 对手混入 ──────────────────────────────────
     parser.add_argument('--greedy_ratio', type=float, default=0.20,
                         help='贪婪 agent 混入概率/座位 (前期建议 20%%)')
@@ -130,6 +147,7 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
     args.share_weights = bool(args.share_weights)
+    args.vectorized = bool(args.vectorized)
 
     if args.batch_size > args.num_buffers:
         print(f'[WARNING] batch_size({args.batch_size}) > num_buffers({args.num_buffers}), '

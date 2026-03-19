@@ -257,4 +257,60 @@ private:
     static void cardset_to_feature(CardSet cs, int8_t* out);
 };
 
+// ======================== Vectorized Engine (batch RL training) ========================
+
+class VectorizedEngine {
+public:
+    struct RuleStepData {
+        int player_id;
+        int8_t obs[STATE_DIM];
+    };
+
+    struct BatchData {
+        std::vector<int8_t> obs_expanded;   // [total_actions * STATE_DIM]
+        std::vector<int8_t> action_flat;    // [total_actions * ACTION_DIM]
+        std::vector<int8_t> obs_raw;        // [K * STATE_DIM]
+        std::vector<int>    offsets;        // [K + 1]
+        std::vector<std::vector<std::string>> action_keys;
+        int total_actions = 0;
+    };
+
+    explicit VectorizedEngine(int num_envs);
+
+    int  num_envs() const { return n_; }
+
+    void set_greedy_ratio(double r);
+    void set_random_ratio(double r);
+    void seed(unsigned int base_seed);
+
+    int  reset(int idx);
+    int  step(int idx, const std::string& action_key);
+    int  get_player_id(int idx) const;
+    bool is_over(int idx) const;
+    bool is_rule_agent_seat(int idx, int pid) const;
+    bool is_declaration_phase(int idx) const;
+    std::string get_rule_agent_action(int idx) const;
+
+    void encode_obs(int idx, int player_id, int8_t* out) const;
+    void get_action_feature(int idx, const std::string& key, int8_t* out) const;
+
+    std::array<float, NUM_PLAYERS> get_training_payoffs(int idx) const;
+    const std::vector<float>& get_step_rewards(int idx, int p) const;
+    std::array<std::array<int64_t, 3>, NUM_PLAYERS> get_aux_targets(int idx) const;
+
+    // Advance one env through rule-agent turns until it needs an RL
+    // decision or the game ends.  Returns (is_game_over, rule_steps).
+    std::pair<bool, std::vector<RuleStepData>> advance_to_decision(int idx);
+
+    // Pick a random legal action and step (for staggering init only).
+    int step_random(int idx);
+
+    // Prepare a single contiguous batch for GPU inference over several envs.
+    BatchData prepare_batch(const std::vector<int>& pending) const;
+
+private:
+    std::vector<Engine> engines_;
+    int n_;
+};
+
 } // namespace a3dizhu

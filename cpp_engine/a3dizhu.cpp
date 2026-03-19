@@ -1288,4 +1288,108 @@ std::string Engine::get_rule_agent_action() const {
     return "";
 }
 
+// ======================== VectorizedEngine ========================
+
+VectorizedEngine::VectorizedEngine(int n) : engines_(n), n_(n) {}
+
+void VectorizedEngine::set_greedy_ratio(double r) {
+    for (auto& e : engines_) e.set_greedy_ratio(r);
+}
+void VectorizedEngine::set_random_ratio(double r) {
+    for (auto& e : engines_) e.set_random_ratio(r);
+}
+void VectorizedEngine::seed(unsigned int base) {
+    for (int i = 0; i < n_; i++) engines_[i].seed(base + i);
+}
+
+int  VectorizedEngine::reset(int i)                          { return engines_[i].reset(); }
+int  VectorizedEngine::step(int i, const std::string& k)     { return engines_[i].step(k); }
+int  VectorizedEngine::get_player_id(int i)           const  { return engines_[i].get_player_id(); }
+bool VectorizedEngine::is_over(int i)                 const  { return engines_[i].is_over(); }
+bool VectorizedEngine::is_rule_agent_seat(int i, int p) const { return engines_[i].is_rule_agent_seat(p); }
+bool VectorizedEngine::is_declaration_phase(int i)    const  { return engines_[i].is_declaration_phase(); }
+std::string VectorizedEngine::get_rule_agent_action(int i) const { return engines_[i].get_rule_agent_action(); }
+
+void VectorizedEngine::encode_obs(int i, int pid, int8_t* out) const {
+    engines_[i].encode_obs(pid, out);
+}
+void VectorizedEngine::get_action_feature(int i, const std::string& k, int8_t* out) const {
+    engines_[i].get_action_feature(k, out);
+}
+
+std::array<float, NUM_PLAYERS> VectorizedEngine::get_training_payoffs(int i) const {
+    return engines_[i].get_training_payoffs();
+}
+const std::vector<float>& VectorizedEngine::get_step_rewards(int i, int p) const {
+    return engines_[i].get_step_rewards(p);
+}
+std::array<std::array<int64_t,3>,NUM_PLAYERS> VectorizedEngine::get_aux_targets(int i) const {
+    return engines_[i].get_aux_targets();
+}
+
+std::pair<bool, std::vector<VectorizedEngine::RuleStepData>>
+VectorizedEngine::advance_to_decision(int idx) {
+    std::vector<RuleStepData> steps;
+    while (!engines_[idx].is_over()) {
+        int pid = engines_[idx].get_player_id();
+        if (!engines_[idx].is_rule_agent_seat(pid)) break;
+
+        RuleStepData sd;
+        sd.player_id = pid;
+        engines_[idx].encode_obs(pid, sd.obs);
+
+        std::string key = engines_[idx].get_rule_agent_action();
+        engines_[idx].step(key);
+        steps.push_back(sd);
+    }
+    return {engines_[idx].is_over(), std::move(steps)};
+}
+
+int VectorizedEngine::step_random(int idx) {
+    if (engines_[idx].is_over()) return engines_[idx].get_player_id();
+    auto actions = engines_[idx].get_legal_actions();
+    if (actions.empty()) return engines_[idx].get_player_id();
+    int choice = std::rand() % (int)actions.size();
+    return engines_[idx].step(actions[choice].key);
+}
+
+VectorizedEngine::BatchData
+VectorizedEngine::prepare_batch(const std::vector<int>& pending) const {
+    BatchData bd;
+    int K = (int)pending.size();
+    bd.offsets.reserve(K + 1);
+    bd.offsets.push_back(0);
+    bd.obs_raw.resize(K * STATE_DIM);
+    bd.action_keys.reserve(K);
+
+    int est = K * 20;
+    bd.obs_expanded.reserve(est * STATE_DIM);
+    bd.action_flat.reserve(est * ACTION_DIM);
+
+    for (int idx = 0; idx < K; idx++) {
+        int e = pending[idx];
+        int pid = engines_[e].get_player_id();
+
+        int8_t* obs_ptr = bd.obs_raw.data() + idx * STATE_DIM;
+        engines_[e].encode_obs(pid, obs_ptr);
+
+        auto actions = engines_[e].get_legal_actions();
+        std::vector<std::string> keys;
+        keys.reserve(actions.size());
+
+        for (auto& a : actions) {
+            bd.obs_expanded.insert(bd.obs_expanded.end(),
+                                   obs_ptr, obs_ptr + STATE_DIM);
+            bd.action_flat.insert(bd.action_flat.end(),
+                                  a.feature, a.feature + ACTION_DIM);
+            keys.push_back(std::move(a.key));
+        }
+
+        bd.total_actions += (int)actions.size();
+        bd.offsets.push_back(bd.total_actions);
+        bd.action_keys.push_back(std::move(keys));
+    }
+    return bd;
+}
+
 } // namespace a3dizhu

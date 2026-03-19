@@ -33,6 +33,7 @@ from .utils import (
     create_buffers,
     create_optimizers,
     act,
+    act_vectorized,
     log,
 )
 from .pettingzoo_utils import (
@@ -140,6 +141,9 @@ class DMCTrainer:
         final_epsilon=0.01,
         epsilon_decay_ratio=0.8,
         min_lr=1e-6,
+        # ─── 向量化 Actor ─────────────────────
+        vectorized=True,
+        envs_per_actor=200,
     ):
         self.env = env
 
@@ -176,6 +180,13 @@ class DMCTrainer:
         self.final_epsilon = final_epsilon
         self.epsilon_decay_frames = int(total_frames * epsilon_decay_ratio)
         self.min_lr = min_lr
+
+        self.vectorized = vectorized
+        self.envs_per_actor = envs_per_actor
+        self.env_config = {
+            'greedy_ratio': getattr(env, 'greedy_ratio', 0.0),
+            'random_ratio': getattr(env, 'random_ratio', 0.0),
+        }
 
         self.is_pettingzoo_env = is_pettingzoo_env
         if not self.is_pettingzoo_env:
@@ -309,9 +320,19 @@ class DMCTrainer:
 
         for device in self.device_iterator:
             for i in range(self.num_actors):
-                actor = ctx.Process(
-                    target=act_pettingzoo if self.is_pettingzoo_env else act,
-                    args=(i, device, self.T, free_queue[device], full_queue[device], models[device], buffers[device], self.env))
+                if self.vectorized and not self.is_pettingzoo_env:
+                    actor = ctx.Process(
+                        target=act_vectorized,
+                        args=(i, device, self.T,
+                              free_queue[device], full_queue[device],
+                              models[device], buffers[device],
+                              self.envs_per_actor, self.env_config))
+                else:
+                    actor = ctx.Process(
+                        target=act_pettingzoo if self.is_pettingzoo_env else act,
+                        args=(i, device, self.T,
+                              free_queue[device], full_queue[device],
+                              models[device], buffers[device], self.env))
                 actor.start()
                 actor_processes.append(actor)
 
