@@ -15,7 +15,7 @@
 #include <intrin.h>
 #endif
 
-namespace a3dizhu {
+namespace a3dizhu_v12 {
 
 // ======================== Platform Compat ========================
 #ifdef _MSC_VER
@@ -401,4 +401,4 @@ private:
     int n_;
 };
 
-} // namespace a3dizhu
+} // namespace a3dizhu_v12

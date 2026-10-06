@@ -4,7 +4,7 @@
 #include "a3dizhu.h"
 
 namespace py = pybind11;
-using namespace a3dizhu;
+using namespace a3dizhu_v12;
 
 PYBIND11_MODULE(a3dizhu_v12_cpp, m) {
     m.doc() = "A3 Dizhu engine with compact batches and 24-step history features";

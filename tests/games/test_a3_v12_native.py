@@ -102,6 +102,19 @@ class TestA3RichNative(unittest.TestCase):
         self.assertEqual(rich.encode_obs(rich.get_player_id()).shape, (2668,))
         self.assertEqual(self.native.FEATURE_VERSION, 'a3-v12-lite-v1')
 
+    def test_native_modules_reject_foreign_engine_types(self):
+        if importlib.util.find_spec('a3dizhu_cpp') is None:
+            self.skipTest('Optional classic A3 extension')
+        import a3dizhu_cpp
+        classic, rich = a3dizhu_cpp.CppEngine(), self.native.CppEngine()
+        classic.reset()
+        rich.reset()
+        # Identical Python class names do not imply compatible native layouts.
+        with self.assertRaises(TypeError):
+            self.native.CppEngine.encode_obs(classic, 0)
+        with self.assertRaises(TypeError):
+            a3dizhu_cpp.CppEngine.encode_obs(rich, 0)
+
     def test_hidden_opponent_cards_do_not_change_public_features(self):
         ranks = ('4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'A', '2', '3')
         hands = [[suit + '_' + rank for rank in ranks]

@@ -4,6 +4,10 @@
 encoding. The default history encoder is an MLP. A Transformer encoder is available
 as a controlled comparison on the same features and game rules.
 
+See [validation results](benchmarks/context-validation.md) and the
+[implementation review](context-review.md) for tested behavior and remaining
+experimental questions.
+
 ## Model and environment
 
 | Component | Configuration |

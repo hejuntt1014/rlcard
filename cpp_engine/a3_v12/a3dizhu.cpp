@@ -4,7 +4,7 @@
 #include <cmath>
 #include <set>
 
-namespace a3dizhu {
+namespace a3dizhu_v12 {
 
 // ======================== Constants ========================
 const int STRAIGHT_RANK_VAL[NUM_RANKS] = {
@@ -1907,4 +1907,4 @@ VectorizedEngine::prepare_batch(const std::vector<int>& pending) const {
     return bd;
 }
 
-} // namespace a3dizhu
+} // namespace a3dizhu_v12
