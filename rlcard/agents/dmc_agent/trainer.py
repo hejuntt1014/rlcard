@@ -63,7 +63,7 @@ class FrameScheduler:
         self.step(state['frames'])
 
 
-def auxiliary_loss(logits, labels, classes):
+def auxiliary_loss(logits, labels, classes, task_groups=None):
     """Masked categorical tasks without host-side tests on CUDA tensors."""
     offset = 0
     losses, active = [], []
@@ -75,12 +75,18 @@ def auxiliary_loss(logits, labels, classes):
         losses.append((loss * valid).sum() / count.clamp(min=1))
         active.append(count > 0)
         offset += width
-    return torch.stack(losses).sum() / torch.stack(active).sum().clamp(min=1)
+    losses, active = torch.stack(losses), torch.stack(active)
+    if task_groups is None:
+        return losses.sum() / active.sum().clamp(min=1)
+    result = losses.new_zeros(())
+    for indices, weight in task_groups:
+        result = result + weight * losses[list(indices)].sum() / active[list(indices)].sum().clamp(min=1)
+    return result
 
 
 def learn(position, actor_models, agent, batch, optimizer, training_device,
           max_grad_norm, mean_episode_return_buf, lock=None, sync_weights=True,
-          aux_weight=.1):
+          aux_weight=.1, aux_groups=None, precision='fp32', scaler=None):
     device = 'cuda:' + str(training_device) if training_device != 'cpu' else 'cpu'
     state = batch['state'].to(device).flatten(0, 1).float()
     action = batch['action'].to(device).flatten(0, 1).float()
@@ -89,15 +95,26 @@ def learn(position, actor_models, agent, batch, optimizer, training_device,
     if returns.numel():
         mean_episode_return_buf[position].append(float(returns.mean()))
     with lock if lock is not None else contextlib.nullcontext():
-        values, aux = agent.forward_with_aux(state, action)
-        loss = compute_loss(values, target)
+        amp = (torch.autocast('cuda', dtype=torch.bfloat16 if precision == 'bf16' else torch.float16)
+               if device != 'cpu' and precision != 'fp32' else contextlib.nullcontext())
+        with amp:
+            values, aux = agent.forward_with_aux(state, action)
+        loss = compute_loss(values.float(), target.float())
         if aux is not None and 'aux_target' in batch:
             labels = batch['aux_target'].to(device).flatten(0, 1).long()
-            loss = loss + aux_weight * auxiliary_loss(aux, labels, agent.net.aux_classes)
+            weight = aux_weight if aux_groups is None else 1.
+            loss = loss + weight * auxiliary_loss(aux.float(), labels, agent.net.aux_classes, aux_groups)
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        nn.utils.clip_grad_norm_(agent.parameters(), max_grad_norm)
-        optimizer.step()
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(agent.parameters(), max_grad_norm)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            nn.utils.clip_grad_norm_(agent.parameters(), max_grad_norm)
+            optimizer.step()
         if sync_weights:
             for model in actor_models.values():
                 model.get_agent(position).load_state_dict(agent.state_dict())
@@ -124,7 +141,8 @@ class DMCTrainer:
                  architecture=None, mlp_layers=None, auxiliary=None,
                  weight_sync_interval=50, stats_interval=50,
                  max_inference_actions=4096, max_episode_steps=10000,
-                 actor_timeout=120, adapter_class=None, env_factory=None, actor_on_cpu=False):
+                 actor_timeout=120, adapter_class=None, env_factory=None, actor_on_cpu=False,
+                 history_encoder='mlp', precision='fp32'):
         positive = dict(batch_size=batch_size, unroll_length=unroll_length,
                         num_buffers=num_buffers, num_actors=num_actors,
                         num_actor_devices=num_actor_devices, envs_per_actor=envs_per_actor,
@@ -146,10 +164,17 @@ class DMCTrainer:
             raise ValueError('Require 0 <= min_lr <= learning_rate and learning_rate > 0')
         if backend not in ('auto', 'python', 'cpp'):
             raise ValueError('backend must be auto, python or cpp')
+        if precision not in ('fp32', 'bf16', 'fp16'):
+            raise ValueError('precision must be fp32, bf16 or fp16')
+        if history_encoder not in ('mlp', 'transformer'):
+            raise ValueError('history_encoder must be mlp or transformer')
+        if precision != 'fp32' and not cuda:
+            raise ValueError('Mixed precision requires CUDA')
         self.env = env
         self.env_source = env_factory or environment_source(env)
         self.is_pettingzoo_env = is_pettingzoo_env
-        is_a3 = not is_pettingzoo_env and getattr(env, 'name', '') == 'a3dizhu'
+        is_v12 = not is_pettingzoo_env and getattr(env, 'name', '') == 'a3dizhu-v12'
+        is_a3 = not is_pettingzoo_env and getattr(env, 'name', '') in ('a3dizhu', 'a3dizhu-v12')
         if is_pettingzoo_env:
             env.reset(seed=seed)
             self.num_players = len(env.possible_agents)
@@ -170,17 +195,26 @@ class DMCTrainer:
         self.state_shape = [[int(n) for n in s] for s in self.state_shape]
         self.action_shape = [[int(n) for n in s] for s in self.action_shape]
         native = False
-        if is_a3 and importlib.util.find_spec('a3dizhu_cpp') is not None:
-            from a3dizhu_cpp import VectorizedEngine
-            native = hasattr(VectorizedEngine, 'advance_to_decision_with_actions')
+        native_module = getattr(env, 'native_module', 'a3dizhu_cpp')
+        if is_a3 and importlib.util.find_spec(native_module) is not None:
+            native_type = importlib.import_module(native_module).VectorizedEngine
+            native = hasattr(native_type, 'advance_to_decision_with_data' if is_v12 else 'advance_to_decision_with_actions')
         if backend == 'cpp' and (not native or adapter_class is not None):
             raise ValueError('Native A3 backend unavailable: build the current C++ extension')
         self.backend = ('cpp' if native and adapter_class is None else 'python') if backend == 'auto' else backend
-        self.architecture = architecture or ('resnet' if is_a3 else 'mlp')
-        self.aux_classes = (3, 3, 3) if (is_a3 if auxiliary is None else auxiliary) else ()
+        self.architecture = architecture or ('context' if is_v12 else 'resnet' if is_a3 else 'mlp')
+        self.aux_classes = tuple(getattr(env, 'aux_classes', (3, 3, 3))) if (is_a3 if auxiliary is None else auxiliary) else ()
+        self.aux_groups = (((0, 1, 2), .1), ((3,), .05), ((4,), .05)) if is_v12 and self.aux_classes else None
+        self.history_encoder, self.precision = history_encoder, precision
+        self.feature_schema = getattr(env, 'feature_schema', 'a3-v6-850-action52-v1' if is_a3 else None)
+        self.reward_mode = getattr(env, 'reward_mode', 'shaped' if is_a3 else 'terminal')
+        if self.architecture == 'context' and not is_v12:
+            raise ValueError('Context architecture requires a3dizhu-v12 features')
+        if self.architecture != 'context' and history_encoder != 'mlp':
+            raise ValueError('history_encoder is only configurable for the context architecture')
         if self.aux_classes and not is_a3:
             raise ValueError('Built-in auxiliary labels are only available for A3')
-        self.mlp_layers = list(mlp_layers or [512] * 5)
+        self.mlp_layers = list(mlp_layers or ([768] * 5 if is_v12 else [512] * 5))
         self.share_weights = share_weights
         if share_weights and (any(tuple(s) != tuple(self.state_shape[0]) for s in self.state_shape)
                               or any(tuple(s) != tuple(self.action_shape[0]) for s in self.action_shape)):
@@ -225,7 +259,7 @@ class DMCTrainer:
     def model_func(self, device):
         return DMCModel(self.state_shape, self.action_shape, self.mlp_layers,
                         self.initial_epsilon, str(device), self.share_weights,
-                        self.architecture, self.aux_classes)
+                        self.architecture, self.aux_classes, self.history_encoder)
 
     def _get_epsilon(self, frames):
         fraction = min(frames / self.epsilon_decay_frames, 1.)
@@ -235,7 +269,10 @@ class DMCTrainer:
         return dict(state_shape=[list(s) for s in self.state_shape],
                     action_shape=self.action_shape, mlp_layers=self.mlp_layers,
                     architecture=self.architecture, aux_classes=list(self.aux_classes),
-                    share_weights=self.share_weights)
+                    share_weights=self.share_weights, history_encoder=self.history_encoder,
+                    feature_schema=self.feature_schema, env_name=getattr(self.env, 'name', 'pettingzoo'),
+                    reward_mode=self.reward_mode, auxiliary_labels='decision-public-v1',
+                    rules=getattr(self.env, 'rules', None))
 
     def start(self):
         torch.manual_seed(self.seed)
@@ -245,6 +282,8 @@ class DMCTrainer:
         unique_opts = list({id(o): o for o in optimizers}.values())
         schedulers = [FrameScheduler(o, self.learning_rate, self.min_lr,
                                      self.total_frames, self.T * self.B) for o in unique_opts]
+        scaler = (torch.amp.GradScaler('cuda') if self.precision == 'fp16'
+                  and self.training_device != 'cpu' else None)
         self.frames = 0
         if self.load_model:
             if not os.path.isfile(self.checkpointpath):
@@ -265,6 +304,8 @@ class DMCTrainer:
                 scheduler.load_state_dict(saved)
             for scheduler in schedulers:
                 scheduler.step(self.frames)
+            if scaler is not None and state.get('scaler_state_dict') is not None:
+                scaler.load_state_dict(state['scaler_state_dict'])
         ctx = mp.get_context('spawn')
         stop = ctx.Event()
         exploration = ctx.Value('d', self._get_epsilon(self.frames))
@@ -286,12 +327,13 @@ class DMCTrainer:
                 for i in range(self.num_buffers):
                     free[device][p].put(i)
                 readers.append((device, p, BatchReader(free[device][p], full[device][p],
-                                                       buffers[device][p], self.B)))
+                                                       buffers[device][p], self.B, batch_major=True)))
         self.plogger = FileWriter(self.xpid, xp_args=dict(
             model=self._model_spec(), backend=self.backend, seed=self.seed,
             batch_size=self.B, unroll_length=self.T, envs_per_actor=self.envs_per_actor,
             num_actors=self.num_actors, actor_devices=self.device_iterator,
-            training_device=self.training_device, weight_sync_interval=self.weight_sync_interval),
+            training_device=self.training_device, weight_sync_interval=self.weight_sync_interval,
+            precision=self.precision, env_config=getattr(self.env, '_creation_config', {})),
             rootdir=self.savedir)
         self.actor_processes = []
         updates = self.frames // (self.T * self.B)
@@ -301,10 +343,14 @@ class DMCTrainer:
         loss_totals = [[] for _ in range(self.num_players)]
 
         def sync_models():
+            # Copy each learner policy to the host once, then publish per-device.
+            positions = [0] if self.share_weights else range(self.num_players)
+            snapshots = {p: {k: v.detach().cpu().clone() for k, v in learner.get_agent(p).state_dict().items()}
+                         for p in positions}
             for device, model in models.items():
                 with locks[device]:
                     for p in ([0] if self.share_weights else range(self.num_players)):
-                        model.get_agent(p).load_state_dict(learner.get_agent(p).state_dict())
+                        model.get_agent(p).load_state_dict(snapshots[p])
                     versions[device].value += 1
 
         def checkpoint():
@@ -312,7 +358,9 @@ class DMCTrainer:
                            optimizer_state_dict=[o.state_dict() for o in optimizers],
                            scheduler_state_dicts=[s.state_dict() for s in schedulers],
                            frames=self.frames, stats=self.stats, share_weights=self.share_weights,
-                           model_spec=self._model_spec(), seed=self.seed)
+                           model_spec=self._model_spec(), seed=self.seed,
+                           scaler_state_dict=scaler.state_dict() if scaler is not None else None,
+                           precision=self.precision)
             temporary = self.checkpointpath + '.tmp'
             torch.save(payload, temporary)
             os.replace(temporary, self.checkpointpath)
@@ -331,7 +379,7 @@ class DMCTrainer:
                                   buffers[device], free[device], full[device], stop, exploration,
                                   errors, counter, self.T, self.envs_per_actor, self.backend,
                                   self.adapter_class, self.max_inference_actions, self.max_episode_steps,
-                                  device, versions[device]))
+                                  device, versions[device], self.precision))
                         actor.start()
                         self.actor_processes.append(actor)
             while self.frames < self.total_frames:
@@ -352,7 +400,8 @@ class DMCTrainer:
                         continue
                     loss = learn(p, {}, learner.get_agent(p), batch, optimizers[p],
                                  self.training_device, self.max_grad_norm,
-                                 self.mean_episode_return_buf, sync_weights=False)
+                                 self.mean_episode_return_buf, sync_weights=False,
+                                 aux_groups=self.aux_groups, precision=self.precision, scaler=scaler)
                     loss_totals[p].append(loss)
                     self.frames += self.T * self.B
                     updates += 1

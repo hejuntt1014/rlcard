@@ -28,11 +28,6 @@ const char* RANK_NAMES[NUM_RANKS] = {
     "4","5","6","7","8","9","10","J","Q","K","A","2","3"
 };
 
-// 8 possible straight sequences (ranks that form consecutive straight values)
-// straight_rank_value 1-5:  3(12),4(0),5(1),6(2),7(3)
-// straight_rank_value 2-6:  4(0),5(1),6(2),7(3),8(4)
-// ...
-// straight_rank_value 8-12: 10(6),J(7),Q(8),K(9),A(10)
 static const int STRAIGHT_SEQS[8][5] = {
     {12, 0, 1, 2, 3},   // 3-4-5-6-7
     { 0, 1, 2, 3, 4},   // 4-5-6-7-8
@@ -82,17 +77,17 @@ std::string HandInfo::to_key() const {
     return key;
 }
 
-void HandInfo::to_feature(int8_t* out) const {
-    std::memset(out, 0, ACTION_DIM);
+void HandInfo::to_card_bits(int8_t* out) const {
+    std::memset(out, 0, NUM_CARDS);
     if (type == HAND_DECLARE) {
-        std::memset(out, 1, ACTION_DIM); // all-ones
+        for (int i = 0; i < NUM_CARDS; i++) out[i] = 1;
         return;
     }
     for_each_card(cards, [&](int c){ out[c] = 1; });
 }
 
 void Engine::cardset_to_feature(CardSet cs, int8_t* out) {
-    std::memset(out, 0, ACTION_DIM);
+    std::memset(out, 0, NUM_CARDS);
     for_each_card(cs, [&](int c){ out[c] = 1; });
 }
 
@@ -125,7 +120,7 @@ static bool is_same_suit(CardSet cs) {
     return false;
 }
 
-static bool check_straight_ranks(CardSet cs) {
+static bool check_straight_ranks(CardSet cs, int start_val = 1, int end_val = 12) {
     uint16_t rank_bits = 0;
     CardSet tmp_cs = cs;
     while (tmp_cs) {
@@ -145,6 +140,7 @@ static bool check_straight_ranks(CardSet cs) {
             if (v > mx) mx = v;
         }
     }
+    if (mn < start_val || mx > end_val) return false;
     return (mx - mn == 4);
 }
 
@@ -251,32 +247,60 @@ bool can_beat(const HandInfo& a, const HandInfo& b) {
 using EnumFn = std::function<void(CardSet)>;
 
 static void enum_2subsets(CardSet cs, const EnumFn& fn) {
-    auto v = cards_vec(cs);
-    for (size_t i = 0; i < v.size(); i++)
-        for (size_t j = i+1; j < v.size(); j++)
-            fn(card_bit(v[i]) | card_bit(v[j]));
+    // Optimized: iterate bits directly without vector allocation
+    uint64_t tmp1 = cs;
+    while (tmp1) {
+        int c1 = ctz64(tmp1);
+        tmp1 &= tmp1 - 1;
+        uint64_t tmp2 = tmp1;
+        while (tmp2) {
+            int c2 = ctz64(tmp2);
+            tmp2 &= tmp2 - 1;
+            fn(card_bit(c1) | card_bit(c2));
+        }
+    }
 }
 
 static void enum_3subsets(CardSet cs, const EnumFn& fn) {
-    auto v = cards_vec(cs);
-    for (size_t i = 0; i < v.size(); i++)
-        for (size_t j = i+1; j < v.size(); j++)
-            for (size_t k = j+1; k < v.size(); k++)
-                fn(card_bit(v[i]) | card_bit(v[j]) | card_bit(v[k]));
+    uint64_t t1 = cs;
+    while (t1) {
+        int c1 = ctz64(t1); t1 &= t1 - 1;
+        uint64_t t2 = t1;
+        while (t2) {
+            int c2 = ctz64(t2); t2 &= t2 - 1;
+            uint64_t t3 = t2;
+            while (t3) {
+                int c3 = ctz64(t3); t3 &= t3 - 1;
+                fn(card_bit(c1) | card_bit(c2) | card_bit(c3));
+            }
+        }
+    }
 }
 
 static void enum_5subsets(CardSet cs, const EnumFn& fn) {
-    auto v = cards_vec(cs);
-    int n = (int)v.size();
-    for (int a=0; a<n; a++)
-     for (int b=a+1; b<n; b++)
-      for (int c=b+1; c<n; c++)
-       for (int d=c+1; d<n; d++)
-        for (int e=d+1; e<n; e++)
-         fn(card_bit(v[a])|card_bit(v[b])|card_bit(v[c])|card_bit(v[d])|card_bit(v[e]));
+    uint64_t t1 = cs;
+    while (t1) {
+        int c1 = ctz64(t1); t1 &= t1 - 1;
+        uint64_t t2 = t1;
+        while (t2) {
+            int c2 = ctz64(t2); t2 &= t2 - 1;
+            uint64_t t3 = t2;
+            while (t3) {
+                int c3 = ctz64(t3); t3 &= t3 - 1;
+                uint64_t t4 = t3;
+                while (t4) {
+                    int c4 = ctz64(t4); t4 &= t4 - 1;
+                    uint64_t t5 = t4;
+                    while (t5) {
+                        int c5 = ctz64(t5); t5 &= t5 - 1;
+                        fn(card_bit(c1)|card_bit(c2)|card_bit(c3)|card_bit(c4)|card_bit(c5));
+                    }
+                }
+            }
+        }
+    }
 }
 
-// Cartesian product for straight enumeration
 static void enum_straight_combos(
     const CardSet rank_cards[5], int depth, CardSet current,
     std::unordered_set<CardSet>& seen,
@@ -303,9 +327,18 @@ static void enum_straight_combos(
 // ======================== Legal Move Enumeration ========================
 
 static void find_straights(CardSet hand, const HandInfo* last,
-    std::unordered_set<CardSet>& seen, std::vector<HandInfo>& results)
+    std::unordered_set<CardSet>& seen, std::vector<HandInfo>& results,
+    int start_val, int end_val)
 {
     for (int si = 0; si < 8; si++) {
+        int seq_min = 99, seq_max = 0;
+        for (int j = 0; j < 5; j++) {
+            int v = STRAIGHT_RANK_VAL[STRAIGHT_SEQS[si][j]];
+            seq_min = std::min(seq_min, v);
+            seq_max = std::max(seq_max, v);
+        }
+        if (seq_min < start_val || seq_max > end_val) continue;
+
         bool has_all = true;
         CardSet rc[5];
         for (int j = 0; j < 5; j++) {
@@ -318,7 +351,8 @@ static void find_straights(CardSet hand, const HandInfo* last,
 }
 
 static void find_flushes(CardSet hand, const HandInfo* last,
-    std::unordered_set<CardSet>& seen, std::vector<HandInfo>& results)
+    std::unordered_set<CardSet>& seen, std::vector<HandInfo>& results,
+    int start_val, int end_val)
 {
     for (int s = 0; s < NUM_SUITS; s++) {
         CardSet sc = hand & suit_mask(s);
@@ -327,7 +361,13 @@ static void find_flushes(CardSet hand, const HandInfo* last,
             if (seen.count(combo)) return;
             HandInfo h = detect_hand(combo, 5);
             if (!h.is_play()) return;
-            if (h.type != HAND_FLUSH) return; // straight_flush handled by find_straights
+            if (h.type == HAND_STRAIGHT_FLUSH) {
+                if (check_straight_ranks(combo, start_val, end_val))
+                    return;
+                h.type = HAND_FLUSH;
+                h.primary_card = find_max_score_card(combo);
+            }
+            if (h.type != HAND_FLUSH) return;
             if (last && !can_beat(h, *last)) return;
             seen.insert(combo);
             results.push_back(h);
@@ -366,7 +406,6 @@ static void find_four_with_ones(CardSet hand, const HandInfo* last,
     for (int qr = 0; qr < NUM_RANKS; qr++) {
         CardSet qc = hand & rank_mask(qr);
         if (popcount64(qc) < 4) continue;
-        // quad is all 4 cards of this rank
         CardSet quad = qc;
         for_each_card(hand & ~quad, [&](int kicker) {
             CardSet combo = quad | card_bit(kicker);
@@ -381,13 +420,21 @@ static void find_four_with_ones(CardSet hand, const HandInfo* last,
 }
 
 static void find_straight_flushes(CardSet hand, const HandInfo* last,
-    std::unordered_set<CardSet>& seen, std::vector<HandInfo>& results)
+    std::unordered_set<CardSet>& seen, std::vector<HandInfo>& results,
+    int start_val, int end_val)
 {
     for (int s = 0; s < NUM_SUITS; s++) {
         CardSet sc = hand & suit_mask(s);
         if (popcount64(sc) < 5) continue;
-        // Find straights within this suit
         for (int si = 0; si < 8; si++) {
+            int seq_min = 99, seq_max = 0;
+            for (int j = 0; j < 5; j++) {
+                int v = STRAIGHT_RANK_VAL[STRAIGHT_SEQS[si][j]];
+                seq_min = std::min(seq_min, v);
+                seq_max = std::max(seq_max, v);
+            }
+            if (seq_min < start_val || seq_max > end_val) continue;
+
             bool has_all = true;
             CardSet rc[5];
             for (int j = 0; j < 5; j++) {
@@ -395,7 +442,6 @@ static void find_straight_flushes(CardSet hand, const HandInfo* last,
                 if (rc[j] == 0) { has_all = false; break; }
             }
             if (!has_all) continue;
-            // Each rank in this suit has exactly 1 card, so only 1 combo
             CardSet combo = rc[0]|rc[1]|rc[2]|rc[3]|rc[4];
             if (seen.count(combo)) continue;
             HandInfo h = detect_hand(combo, 5);
@@ -420,18 +466,16 @@ static bool hand_sort_cmp(const HandInfo& a, const HandInfo& b) {
     return card_score(a.primary_card) < card_score(b.primary_card);
 }
 
-std::vector<HandInfo> get_all_hands(CardSet hand) {
+std::vector<HandInfo> get_all_hands(CardSet hand, int start_val, int end_val) {
     std::vector<HandInfo> results;
     std::unordered_set<CardSet> seen;
 
-    // Singles
     for_each_card(hand, [&](int c) {
         CardSet cs = card_bit(c);
         results.push_back({HAND_SINGLE, cs, c, 1});
         seen.insert(cs);
     });
 
-    // Pairs and Triples
     for (int r = 0; r < NUM_RANKS; r++) {
         CardSet rc = hand & rank_mask(r);
         int cnt = popcount64(rc);
@@ -455,18 +499,16 @@ std::vector<HandInfo> get_all_hands(CardSet hand) {
         }
     }
 
-    // 5-card hands
-    find_straights(hand, nullptr, seen, results);
-    find_flushes(hand, nullptr, seen, results);
+    find_straights(hand, nullptr, seen, results, start_val, end_val);
+    find_flushes(hand, nullptr, seen, results, start_val, end_val);
     find_full_houses(hand, nullptr, seen, results);
     find_four_with_ones(hand, nullptr, seen, results);
-    // straight_flushes already found by find_straights (detect_hand returns SF)
 
     std::sort(results.begin(), results.end(), hand_sort_cmp);
     return results;
 }
 
-std::vector<HandInfo> get_beating_hands(CardSet hand, const HandInfo& last) {
+std::vector<HandInfo> get_beating_hands(CardSet hand, const HandInfo& last, int start_val, int end_val) {
     std::vector<HandInfo> results;
     std::unordered_set<CardSet> seen;
 
@@ -497,11 +539,11 @@ std::vector<HandInfo> get_beating_hands(CardSet hand, const HandInfo& last) {
         }
     } else if (last.size == 5) {
         int lp = five_card_priority(last.type);
-        if (lp <= 0) find_straights(hand, &last, seen, results);
-        if (lp <= 1) find_flushes(hand, &last, seen, results);
+        if (lp <= 0) find_straights(hand, &last, seen, results, start_val, end_val);
+        if (lp <= 1) find_flushes(hand, &last, seen, results, start_val, end_val);
         if (lp <= 2) find_full_houses(hand, &last, seen, results);
         if (lp <= 3) find_four_with_ones(hand, &last, seen, results);
-        if (lp <= 4) find_straight_flushes(hand, &last, seen, results);
+        if (lp <= 4) find_straight_flushes(hand, &last, seen, results, start_val, end_val);
     }
 
     std::sort(results.begin(), results.end(), hand_sort_cmp);
@@ -514,8 +556,8 @@ void assign_teams(const CardSet hands[NUM_PLAYERS],
                   Team out[NUM_PLAYERS], bool& is_solo)
 {
     int s3_owner = -1, sA_owner = -1;
-    int spade3 = make_card(3, 12); // spade_3
-    int spadeA = make_card(3, 10); // spade_A
+    int spade3 = make_card(3, 12);
+    int spadeA = make_card(3, 10);
     for (int i = 0; i < NUM_PLAYERS; i++) {
         if (hands[i] & card_bit(spade3)) s3_owner = i;
         if (hands[i] & card_bit(spadeA)) sA_owner = i;
@@ -583,7 +625,6 @@ bool GameState::is_terminal() const {
         }
     }
 
-    // Check if any team's members are all finished
     std::unordered_map<int, std::vector<int>> team_members;
     for (int i = 0; i < num_players; i++) {
         if (actual_teams[i] != TEAM_UNKNOWN)
@@ -611,18 +652,31 @@ int GameState::next_active(int from_player) const {
 
 std::vector<HandInfo> GameState::get_legal_moves() const {
     if (is_declaration_phase) {
-        HandInfo decl; decl.type = HAND_DECLARE; decl.size = 0;
-        HandInfo pass; // default HAND_PASS
-        return {decl, pass};
+        std::vector<HandInfo> moves;
+        bool can_declare = true;
+        if (declare_require_both_spades) {
+            int spade3 = make_card(3, 12);
+            int spadeA = make_card(3, 10);
+            can_declare = (hands[declaration_turn] & card_bit(spade3)) != 0
+                       && (hands[declaration_turn] & card_bit(spadeA)) != 0;
+        }
+        if (can_declare) {
+            HandInfo decl; decl.type = HAND_DECLARE; decl.size = 0;
+            moves.push_back(decl);
+        }
+        HandInfo pass;
+        moves.push_back(pass);
+        return moves;
     }
     CardSet my = hands[current_player];
     if (my == 0) return {};
 
+    int sv = straight_start_val, ev = straight_end_val;
+
     if (last_play.is_pass()) {
-        // Free play
-        auto all = get_all_hands(my);
+        auto all = get_all_hands(my, sv, ev);
         if (is_first_turn) {
-            int diamond4 = make_card(0, 0); // diamond_4
+            int diamond4 = make_card(0, 0);
             std::vector<HandInfo> filtered;
             for (auto& h : all) {
                 if (h.cards & card_bit(diamond4))
@@ -632,11 +686,9 @@ std::vector<HandInfo> GameState::get_legal_moves() const {
         }
         return all;
     } else {
-        auto beating = get_beating_hands(my, last_play);
-        // If only 1 card left and can beat, must play (no pass)
+        auto beating = get_beating_hands(my, last_play, sv, ev);
         if (popcount64(my) == 1 && !beating.empty())
             return beating;
-        // Add pass option
         HandInfo pass;
         beating.push_back(pass);
         return beating;
@@ -645,10 +697,12 @@ std::vector<HandInfo> GameState::get_legal_moves() const {
 
 GameState GameState::apply_move(const HandInfo& move) const {
     if (is_declaration_phase) {
-        // Declaration phase
         int p = declaration_turn;
         if (move.is_declare()) {
             GameState ns;
+            ns.declare_require_both_spades = declare_require_both_spades;
+            ns.straight_start_val = straight_start_val;
+            ns.straight_end_val = straight_end_val;
             for (int i = 0; i < num_players; i++) ns.hands[i] = hands[i];
             ns.current_player = current_player;
             ns.last_play = {}; ns.last_play_player = -1;
@@ -667,6 +721,9 @@ GameState GameState::apply_move(const HandInfo& move) const {
             int new_passes = declaration_passes + 1;
             int next_turn = (p + 1) % num_players;
             GameState ns;
+            ns.declare_require_both_spades = declare_require_both_spades;
+            ns.straight_start_val = straight_start_val;
+            ns.straight_end_val = straight_end_val;
             for (int i = 0; i < num_players; i++) ns.hands[i] = hands[i];
             ns.current_player = current_player;
             ns.last_play = {}; ns.last_play_player = -1;
@@ -689,7 +746,6 @@ GameState GameState::apply_move(const HandInfo& move) const {
     }
 
     if (move.is_pass()) {
-        // Pass
         std::set<int> finished(rankings.begin(), rankings.end());
         int active_count = num_players - (int)rankings.size();
         int new_pass_count = pass_count + 1;
@@ -697,6 +753,9 @@ GameState GameState::apply_move(const HandInfo& move) const {
         int passes_needed = last_still_active ? active_count - 1 : active_count;
 
         GameState ns;
+        ns.declare_require_both_spades = declare_require_both_spades;
+        ns.straight_start_val = straight_start_val;
+        ns.straight_end_val = straight_end_val;
         for (int i = 0; i < num_players; i++) ns.hands[i] = hands[i];
         ns.rankings = rankings;
         for (int i = 0; i < num_players; i++) ns.actual_teams[i] = actual_teams[i];
@@ -727,9 +786,11 @@ GameState GameState::apply_move(const HandInfo& move) const {
         return ns;
     }
 
-    // Play cards
     CardSet played = move.cards;
     GameState ns;
+    ns.declare_require_both_spades = declare_require_both_spades;
+    ns.straight_start_val = straight_start_val;
+    ns.straight_end_val = straight_end_val;
     for (int i = 0; i < num_players; i++)
         ns.hands[i] = (i == current_player) ? (hands[i] & ~played) : hands[i];
 
@@ -752,7 +813,6 @@ GameState GameState::apply_move(const HandInfo& move) const {
     ns.is_declaration_phase = false;
     ns.compute_observed_teams();
 
-    // Check terminal → fill remaining players into rankings
     if (ns.is_terminal()) {
         std::set<int> fin(ns.rankings.begin(), ns.rankings.end());
         std::vector<int> remaining;
@@ -765,7 +825,6 @@ GameState GameState::apply_move(const HandInfo& move) const {
     }
 
     std::set<int> finished_final(ns.rankings.begin(), ns.rankings.end());
-    // Find next active player
     int np = current_player;
     for (int off = 1; off <= num_players; off++) {
         int p = (current_player + off) % num_players;
@@ -781,10 +840,8 @@ GameState GameState::apply_move(const HandInfo& move) const {
 std::array<float,NUM_PLAYERS> compute_payoffs(const GameState& st) {
     if (st.is_declared && st.declarant >= 0)
         return compute_declared_payoffs(st.rankings, st.declarant);
-
     std::array<float,NUM_PLAYERS> payoffs = {0,0,0,0};
     int rank_points[] = {3, 2, 1, 0};
-
     if (st.is_solo) {
         int solo_idx = -1;
         for (int i = 0; i < st.num_players; i++)
@@ -799,13 +856,11 @@ std::array<float,NUM_PLAYERS> compute_payoffs(const GameState& st) {
             if (i != solo_idx) payoffs[i] = -payoffs[solo_idx] / 3.0f;
         return payoffs;
     }
-
     std::vector<int> team_a, team_b;
     for (int i = 0; i < st.num_players; i++) {
         if (st.actual_teams[i] == TEAM_SPADE_A3) team_a.push_back(i);
         else if (st.actual_teams[i] == TEAM_OPPONENT) team_b.push_back(i);
     }
-
     auto team_avg = [&](const std::vector<int>& members) -> float {
         if (members.empty()) return 0.0f;
         float total = 0;
@@ -817,7 +872,6 @@ std::array<float,NUM_PLAYERS> compute_payoffs(const GameState& st) {
         }
         return total / members.size();
     };
-
     float diff = team_avg(team_a) - team_avg(team_b);
     for (int i : team_a) payoffs[i] = diff;
     for (int i : team_b) payoffs[i] = -diff;
@@ -846,7 +900,6 @@ std::array<float,NUM_PLAYERS> compute_declared_payoffs(
 std::array<float,NUM_PLAYERS> compute_training_payoffs(const GameState& st) {
     if (st.is_declared && st.declarant >= 0)
         return compute_declared_payoffs(st.rankings, st.declarant);
-
     auto payoffs = compute_payoffs(st);
     const float rank_bonus[] = {0.3f, 0.1f, -0.1f, -0.3f};
     for (int i = 0; i < st.num_players; i++) {
@@ -865,18 +918,14 @@ static std::pair<int, float> get_teammate_confidence(
 {
     Team my_team = actual[pid];
     if (my_team == TEAM_SOLO) return {-1, 0.0f};
-
     int actual_teammate = -1;
     for (int i = 0; i < np; i++)
         if (i != pid && actual[i] == my_team) { actual_teammate = i; break; }
     if (actual_teammate < 0) return {-1, 0.0f};
-
     if (my_team == TEAM_SPADE_A3) {
         if (observed[actual_teammate] == TEAM_SPADE_A3) return {actual_teammate, 1.0f};
         return {actual_teammate, 0.0f};
     }
-
-    // OPPONENT team
     int revealed = 0;
     for (int i = 0; i < np; i++) {
         if (i != pid && (observed[i] == TEAM_SPADE_A3 || observed[i] == TEAM_SOLO))
@@ -896,13 +945,27 @@ float compute_step_reward(
     const GameState& next, int player_id)
 {
     if (prev.is_declaration_phase) return 0.0f;
+    if (prev.is_declared) {
+        if (player_id == prev.declarant) return 0.0f;
+        auto is_teammate = [&](int other) {
+            return other >= 0 && other < prev.num_players
+                && other != player_id && other != prev.declarant;
+        };
+        float reward = 0.0f;
+        if (is_teammate(prev.last_play_player)) {
+            if (action.is_pass()) reward += REWARD_LET_TEAMMATE;
+            if (action.is_play()) reward += REWARD_BEAT_TEAMMATE;
+        }
+        if (action.is_play() && next.hands[player_id] == 0
+            && !next.is_terminal() && is_teammate(next.current_player))
+            reward += REWARD_FEED_TEAMMATE;
+        return reward;
+    }
     auto [teammate, confidence] = get_teammate_confidence(
         player_id, prev.actual_teams, prev.observed_teams, prev.num_players);
     if (confidence <= 0.0f || teammate < 0) return 0.0f;
-
     float reward = 0.0f;
     int last_player = prev.last_play_player;
-
     if (action.is_pass() && last_player == teammate)
         reward += REWARD_LET_TEAMMATE;
     if (action.is_play() && last_player == teammate)
@@ -910,8 +973,104 @@ float compute_step_reward(
     if (action.is_play() && next.hands[player_id] == 0
         && next.current_player == teammate)
         reward += REWARD_FEED_TEAMMATE;
-
     return reward * confidence;
+}
+
+// ======================== Afterstate Computation ========================
+
+AfterstateInfo compute_afterstate(CardSet hand_after, int start_val, int end_val) {
+    AfterstateInfo info;
+    std::memset(&info, 0, sizeof(info));
+    info.remaining_count = popcount64(hand_after);
+
+    int rank_count[NUM_RANKS] = {};
+    for_each_card(hand_after, [&](int c) {
+        rank_count[card_rank(c)]++;
+    });
+
+    for (int r = 0; r < NUM_RANKS; r++) {
+        if (rank_count[r] == 1) info.singles_count++;
+        else if (rank_count[r] == 2) info.pairs_count++;
+        else if (rank_count[r] == 3) info.triples_count++;
+    }
+
+    int spade3 = make_card(3, 12);
+    int spadeA = make_card(3, 10);
+    info.has_s3 = (hand_after & card_bit(spade3)) != 0;
+    info.has_sa = (hand_after & card_bit(spadeA)) != 0;
+
+    // rank 12 = '3' (strongest single), rank 11 = '2' (second strongest)
+    info.has_rank3_single = (rank_count[12] == 1);
+    info.has_rank2_single = (rank_count[11] == 1);
+
+    // Straight potential: at least 5 consecutive ranks present
+    for (int si = 0; si < 8; si++) {
+        int seq_min = 99, seq_max = 0;
+        bool has_all = true;
+        for (int j = 0; j < 5; j++) {
+            int v = STRAIGHT_RANK_VAL[STRAIGHT_SEQS[si][j]];
+            seq_min = std::min(seq_min, v);
+            seq_max = std::max(seq_max, v);
+            if (rank_count[STRAIGHT_SEQS[si][j]] == 0) { has_all = false; break; }
+        }
+        if (has_all && seq_min >= start_val && seq_max <= end_val) {
+            info.has_straight_potential = true;
+            break;
+        }
+    }
+
+    // Flush potential: 5+ cards of same suit
+    for (int s = 0; s < NUM_SUITS; s++) {
+        int suit_cnt = popcount64(hand_after & suit_mask(s));
+        if (suit_cnt >= 5) {
+            info.has_flush_potential = true;
+            if (info.has_straight_potential) {
+                // Check straight flush potential within this suit
+                CardSet sc = hand_after & suit_mask(s);
+                for (int si = 0; si < 8; si++) {
+                    int seq_min = 99, seq_max = 0;
+                    bool ok = true;
+                    for (int j = 0; j < 5; j++) {
+                        int v = STRAIGHT_RANK_VAL[STRAIGHT_SEQS[si][j]];
+                        seq_min = std::min(seq_min, v);
+                        seq_max = std::max(seq_max, v);
+                        if (!(sc & rank_mask(STRAIGHT_SEQS[si][j]))) { ok = false; break; }
+                    }
+                    if (ok && seq_min >= start_val && seq_max <= end_val) {
+                        info.has_sf_potential = true;
+                        break;
+                    }
+                }
+            }
+            if (info.has_sf_potential) break;
+        }
+    }
+
+    // Three+pair or four+one potential
+    int quads = 0;
+    int pair_ranks = 0, triple_ranks = 0;
+    for (int r = 0; r < NUM_RANKS; r++) {
+        if (rank_count[r] >= 4) quads++;
+        if (rank_count[r] >= 2) pair_ranks++;
+        if (rank_count[r] >= 3) triple_ranks++;
+    }
+    info.has_threepair_or_fourone_potential =
+        (triple_ranks > 0 && pair_ranks >= 2) ||
+        (quads > 0 && info.remaining_count >= 5);
+
+    // Approximate 5-card action count
+    int fc = 0;
+    if (info.has_straight_potential) fc++;
+    if (info.has_flush_potential) fc++;
+    if (info.has_sf_potential) fc++;
+    if (info.has_threepair_or_fourone_potential) fc++;
+    info.fivecard_potential = fc;
+
+    // Rank-group heuristic only; this is not an optimal hand decomposition.
+    int steps = info.singles_count + info.pairs_count + info.triples_count + quads;
+    info.min_steps = std::max(steps, info.remaining_count > 0 ? 1 : 0);
+
+    return info;
 }
 
 // ======================== Engine ========================
@@ -919,18 +1078,19 @@ float compute_step_reward(
 Engine::Engine() : rng_(42) {
     std::memset(played_cards_, 0, sizeof(played_cards_));
     std::memset(seat_agents_, 0, sizeof(seat_agents_));
+    last_nonpass_player_ = -1;
 }
 
 void Engine::seed(unsigned int s) { rng_.seed(s); }
 
 int Engine::reset() {
-    // Clear tracking
     action_history_.clear();
     std::memset(played_cards_, 0, sizeof(played_cards_));
     for (int i = 0; i < NUM_PLAYERS; i++) step_rewards_[i].clear();
     key_to_hand_.clear();
+    last_nonpass_action_ = {};
+    last_nonpass_player_ = -1;
 
-    // Assign rule agent seats
     std::uniform_real_distribution<double> dist(0.0, 1.0);
     for (int seat = 0; seat < NUM_PLAYERS; seat++) {
         double roll = dist(rng_);
@@ -942,7 +1102,6 @@ int Engine::reset() {
             seat_agents_[seat] = SEAT_RL;
     }
 
-    // Shuffle and deal
     std::vector<int> deck(NUM_CARDS);
     std::iota(deck.begin(), deck.end(), 0);
     std::shuffle(deck.begin(), deck.end(), rng_);
@@ -951,7 +1110,6 @@ int Engine::reset() {
     for (int i = 0; i < NUM_CARDS; i++)
         state_.hands[i / 13] |= card_bit(deck[i]);
 
-    // Find diamond_4 holder
     int diamond4 = make_card(0, 0);
     int start = 0;
     for (int i = 0; i < NUM_PLAYERS; i++)
@@ -965,6 +1123,12 @@ int Engine::reset() {
     state_.rankings.clear();
     state_.num_players = NUM_PLAYERS;
     state_.spade3_player = -1; state_.spadeA_player = -1;
+
+    std::uniform_int_distribution<int> bin(0, 1);
+    state_.declare_require_both_spades = bin(rng_);
+    state_.straight_start_val = bin(rng_) ? 2 : 1;
+    state_.straight_end_val   = bin(rng_) ? 12 : 11;
+
     state_.is_declaration_phase = true;
     state_.declaration_turn = 0;
     state_.declaration_passes = 0;
@@ -972,9 +1136,14 @@ int Engine::reset() {
     state_.compute_observed_teams();
 
     prev_state_ = state_;
-
-    // Declaration phase starts from seat 0
     return state_.declaration_turn;
+}
+
+void Engine::set_rules(bool declare_require_both_spades, int straight_start_val, int straight_end_val) {
+    state_.declare_require_both_spades = declare_require_both_spades;
+    state_.straight_start_val = straight_start_val;
+    state_.straight_end_val = straight_end_val;
+    key_to_hand_.clear();
 }
 
 int Engine::reset_with_hands(
@@ -985,11 +1154,11 @@ int Engine::reset_with_hands(
     std::memset(played_cards_, 0, sizeof(played_cards_));
     for (int i = 0; i < NUM_PLAYERS; i++) step_rewards_[i].clear();
     key_to_hand_.clear();
+    last_nonpass_action_ = {};
+    last_nonpass_player_ = -1;
 
-    // No rule agents for parity testing
     for (int i = 0; i < NUM_PLAYERS; i++) seat_agents_[i] = SEAT_RL;
 
-    // Build hands from card id strings
     for (int i = 0; i < NUM_PLAYERS; i++) {
         state_.hands[i] = 0;
         for (auto& cid : hands_ids[i]) {
@@ -1006,6 +1175,9 @@ int Engine::reset_with_hands(
     state_.rankings.clear();
     state_.num_players = NUM_PLAYERS;
     state_.spade3_player = -1; state_.spadeA_player = -1;
+    state_.declare_require_both_spades = false;
+    state_.straight_start_val = 1;
+    state_.straight_end_val = 12;
     state_.is_declaration_phase = true;
     state_.declaration_turn = 0;
     state_.declaration_passes = 0;
@@ -1013,15 +1185,14 @@ int Engine::reset_with_hands(
     state_.compute_observed_teams();
 
     prev_state_ = state_;
-    return state_.declaration_turn; // always 0
+    return state_.declaration_turn;
 }
 
 HandInfo Engine::resolve_action(const std::string& key) const {
-    if (key == "pass") return {}; // HAND_PASS
+    if (key == "pass") return {};
     if (key == "declare") { HandInfo h; h.type = HAND_DECLARE; return h; }
     auto it = key_to_hand_.find(key);
     if (it != key_to_hand_.end()) return it->second;
-    // Parse key: "suit_rank|suit_rank|..."
     CardSet cs = 0;
     std::istringstream iss(key);
     std::string token;
@@ -1031,7 +1202,15 @@ HandInfo Engine::resolve_action(const std::string& key) const {
     }
     int sz = popcount64(cs);
     if (sz == 0) return {};
-    return detect_hand(cs, sz);
+    HandInfo hand = detect_hand(cs, sz);
+    // Legal move enumeration treats an out-of-range straight flush as a
+    // flush. Uncached keys must use the same room-rule interpretation.
+    if (hand.type == HAND_STRAIGHT_FLUSH
+        && !check_straight_ranks(cs, state_.straight_start_val, state_.straight_end_val)) {
+        hand.type = HAND_FLUSH;
+        hand.primary_card = find_max_score_card(cs);
+    }
+    return hand;
 }
 
 int Engine::step(const std::string& action_key) {
@@ -1040,11 +1219,12 @@ int Engine::step(const std::string& action_key) {
 
     HandInfo action = resolve_action(action_key);
 
-    // Track history and played cards (only in play phase)
     if (!state_.is_declaration_phase) {
-        action_history_.push_back({player_id, action.is_play() ? action.cards : 0});
+        action_history_.push_back({player_id, action});
         if (action.is_play()) {
             played_cards_[player_id] |= action.cards;
+            last_nonpass_action_ = action;
+            last_nonpass_player_ = player_id;
         }
     }
 
@@ -1077,77 +1257,118 @@ const std::vector<float>& Engine::get_step_rewards(int p) const {
     return step_rewards_[p];
 }
 
-std::array<std::array<int64_t,3>,NUM_PLAYERS> Engine::get_aux_targets() const {
-    std::array<std::array<int64_t,3>,NUM_PLAYERS> targets;
+// ======================== V11 Aux Targets ========================
+
+std::array<Engine::AuxTargets,NUM_PLAYERS> Engine::get_aux_targets() const {
+    std::array<AuxTargets, NUM_PLAYERS> all;
     const Team* actual = state_.actual_teams;
     const Team* observed = state_.observed_teams;
-    const int team_cls[] = {0, 1, 2, 1}; // SPADE_A3=0, OPPONENT=1, SOLO=2, UNKNOWN→1
 
     for (int p = 0; p < NUM_PLAYERS; p++) {
+        int rel_order[NUM_PLAYERS];
+        for (int i = 0; i < NUM_PLAYERS; i++)
+            rel_order[i] = (p + i) % NUM_PLAYERS;
+
+        Team my_team = actual[p];
+
+        // relation: for each of 3 opponents
+        // target values align with obs encoding: 1=same_side, 2=opposite_side, -1=unknown
         for (int j = 0; j < 3; j++) {
-            int other = (p + j + 1) % NUM_PLAYERS;
-            if (observed[other] == TEAM_UNKNOWN)
-                targets[p][j] = -1;
-            else
-                targets[p][j] = team_cls[(int)actual[other]];
+            int other = rel_order[j + 1];
+            if (observed[other] == TEAM_UNKNOWN) {
+                all[p].relation[j] = -1;
+            } else if (state_.is_declared) {
+                if (p == state_.declarant)
+                    all[p].relation[j] = 2; // opposite
+                else if (other == state_.declarant)
+                    all[p].relation[j] = 2; // opposite
+                else
+                    all[p].relation[j] = 1; // same (both anti-declarant)
+            } else {
+                bool same = (my_team == observed[other]);
+                all[p].relation[j] = same ? 1 : 2;
+            }
+        }
+
+        // s3_owner: relative slot of spade3 holder (-1 if not publicly known)
+        all[p].s3_owner = -1;
+        if (state_.spade3_player >= 0) {
+            for (int i = 0; i < NUM_PLAYERS; i++) {
+                if (rel_order[i] == state_.spade3_player) {
+                    all[p].s3_owner = i;
+                    break;
+                }
+            }
+        }
+
+        // sa_owner: relative slot of spadeA holder
+        all[p].sa_owner = -1;
+        if (state_.spadeA_player >= 0) {
+            for (int i = 0; i < NUM_PLAYERS; i++) {
+                if (rel_order[i] == state_.spadeA_player) {
+                    all[p].sa_owner = i;
+                    break;
+                }
+            }
         }
     }
-    return targets;
+    return all;
 }
 
-// ======================== State Encoding (850-dim) ========================
+// ======================== V11 State Encoding ========================
 
 void Engine::encode_obs(int player_id, int8_t* out) const {
     std::memset(out, 0, STATE_DIM);
+    encode_obs_static(player_id, out);
+    encode_hist_tokens(player_id, out + OBS_STATIC_DIM);
+}
+
+void Engine::encode_obs_static(int player_id, int8_t* out) const {
     int8_t* ptr = out;
     int n = NUM_PLAYERS;
 
-    // Relative seat order: [me, next, across, previous]
     int rel_order[NUM_PLAYERS];
     for (int i = 0; i < n; i++) rel_order[i] = (player_id + i) % n;
 
-    // 1. My hand (52d)
+    int spade3 = make_card(3, 12);
+    int spadeA = make_card(3, 10);
+
+    // [0:52] own_cards
     for_each_card(state_.hands[player_id], [&](int c){ ptr[c] = 1; });
     ptr += NUM_CARDS;
 
-    // 2. Last play cards (52d)
+    // [52:104] current_top_action (last play to beat, 0 if free play)
     if (state_.last_play.is_play())
         for_each_card(state_.last_play.cards, [&](int c){ ptr[c] = 1; });
     ptr += NUM_CARDS;
 
-    // 3. Last play player (4d relative one-hot)
-    if (state_.last_play_player >= 0) {
+    // [104:108] current_top_actor
+    if (state_.last_play_player >= 0 && state_.last_play.is_play()) {
         for (int i = 0; i < n; i++)
             if (rel_order[i] == state_.last_play_player) { ptr[i] = 1; break; }
     }
     ptr += n;
 
-    // 4. History (HISTORY_LEN × 57d)
-    int hist_start = std::max(0, (int)action_history_.size() - HISTORY_LEN);
-    int hist_count = (int)action_history_.size() - hist_start;
-    for (int h = 0; h < hist_count; h++) {
-        auto& entry = action_history_[hist_start + h];
-        // Player (4d relative one-hot)
-        for (int i = 0; i < n; i++)
-            if (rel_order[i] == entry.player_id) { ptr[i] = 1; break; }
-        ptr += n;
-        // Valid flag (1d)
-        *ptr++ = 1;
-        // Cards (52d)
-        for_each_card(entry.cards, [&](int c){ ptr[c] = 1; });
-        ptr += NUM_CARDS;
-    }
-    // Pad empty history slots (valid=0, rest=0)
-    ptr += (HISTORY_LEN - hist_count) * HISTORY_STEP_DIM;
+    // [108:160] last_nonpass_action
+    if (last_nonpass_action_.is_play())
+        for_each_card(last_nonpass_action_.cards, [&](int c){ ptr[c] = 1; });
+    ptr += NUM_CARDS;
 
-    // 5. Played cards per player (4×52d, relative order)
+    // [160:164] last_nonpass_actor
+    if (last_nonpass_player_ >= 0) {
+        for (int i = 0; i < n; i++)
+            if (rel_order[i] == last_nonpass_player_) { ptr[i] = 1; break; }
+    }
+    ptr += n;
+
+    // [164:372] public_played_4p (4×52D)
     for (int i = 0; i < n; i++) {
         int abs_i = rel_order[i];
         for_each_card(played_cards_[abs_i], [&](int c){ ptr[c] = 1; });
         ptr += NUM_CARDS;
     }
 
-    // 6. Remaining hand count one-hot (4×14d, relative order)
+    // [372:428] remaining_count_4p (4×14D)
     for (int i = 0; i < n; i++) {
         int abs_i = rel_order[i];
         int cnt = std::min(popcount64(state_.hands[abs_i]), 13);
@@ -1155,51 +1376,340 @@ void Engine::encode_obs(int player_id, int8_t* out) const {
         ptr += 14;
     }
 
-    // 7. Team one-hot (4×4d, relative order)
-    // Teams order: SPADE_A3=0, OPPONENT=1, SOLO=2, UNKNOWN=3
+    // [428:444] public_status_4p (4×4D: played_s3, played_sa, declared, finished)
+    std::set<int> finished_set(state_.rankings.begin(), state_.rankings.end());
     for (int i = 0; i < n; i++) {
         int abs_i = rel_order[i];
-        Team team;
-        if (abs_i == player_id)
-            team = state_.actual_teams[abs_i]; // I know my own team
-        else
-            team = state_.observed_teams[abs_i]; // Others: observed only
-        ptr[(int)team] = 1;
+        ptr[0] = (played_cards_[abs_i] & card_bit(spade3)) ? 1 : 0;
+        ptr[1] = (played_cards_[abs_i] & card_bit(spadeA)) ? 1 : 0;
+        ptr[2] = (state_.is_declared && abs_i == state_.declarant) ? 1 : 0;
+        ptr[3] = finished_set.count(abs_i) ? 1 : 0;
         ptr += 4;
     }
 
-    // 8. Misc (6d)
-    ptr[0] = state_.last_play.is_pass() ? 1 : 0;  // free play
-    ptr[1] = state_.is_first_turn ? 1 : 0;
-    ptr[2] = (int8_t)std::min(state_.pass_count, 3);
-    ptr[3] = (int8_t)state_.rankings.size();
-    ptr[4] = state_.is_solo ? 1 : 0;
-    ptr[5] = state_.is_declaration_phase ? 1 : 0;
+    // [444:447] game_mode_state (3D one-hot: normal, solo, declarer)
+    if (state_.is_declared) {
+        ptr[2] = 1;
+    } else if (state_.is_solo && state_.actual_teams[player_id] == TEAM_SOLO) {
+        ptr[1] = 1; // I know I'm solo
+    } else {
+        ptr[0] = 1; // normal team mode (from my perspective)
+    }
+    ptr += 3;
+
+    // [447:452] self_side_state (5D: unknown, a3_side, non_a3, declarer_side, anti_declarer)
+    Team my_actual = state_.actual_teams[player_id];
+    if (state_.is_declared) {
+        if (player_id == state_.declarant)
+            ptr[3] = 1; // declarer_side
+        else
+            ptr[4] = 1; // anti_declarer_side
+    } else if (my_actual == TEAM_SPADE_A3 || my_actual == TEAM_SOLO) {
+        ptr[1] = 1; // a3_side
+    } else if (my_actual == TEAM_OPPONENT) {
+        ptr[2] = 1; // non_a3_side
+    } else {
+        ptr[0] = 1; // unknown (shouldn't happen)
+    }
+    ptr += 5;
+
+    // [452:461] other_relation_to_self (3×3D: unknown, same, opposite)
+    for (int j = 0; j < 3; j++) {
+        int other = rel_order[j + 1];
+        Team other_obs = state_.observed_teams[other];
+
+        if (other_obs == TEAM_UNKNOWN) {
+            ptr[0] = 1; // unknown
+        } else if (state_.is_declared) {
+            if (player_id == state_.declarant) {
+                ptr[2] = 1; // opposite (I'm declarant, everyone else is against me)
+            } else if (other == state_.declarant) {
+                ptr[2] = 1; // opposite (other is declarant)
+            } else {
+                ptr[1] = 1; // same (both anti-declarant)
+            }
+        } else {
+            bool same_side = (my_actual == other_obs);
+            if (same_side)
+                ptr[1] = 1; // same_side
+            else
+                ptr[2] = 1; // opposite_side
+        }
+        ptr += 3;
+    }
+
+    // [461:513] unseen_cards (52D)
+    CardSet my_hand = state_.hands[player_id];
+    CardSet all_played = 0;
+    for (int i = 0; i < n; i++) all_played |= played_cards_[i];
+    CardSet unseen = ~(my_hand | all_played) & ((1ULL << NUM_CARDS) - 1);
+    for_each_card(unseen, [&](int c){ ptr[c] = 1; });
+    ptr += NUM_CARDS;
+
+    // [513:525] s3_sa_tracker (12D)
+    *ptr++ = (my_hand & card_bit(spade3)) ? 1 : 0;
+    *ptr++ = (my_hand & card_bit(spadeA)) ? 1 : 0;
+    *ptr++ = (all_played & card_bit(spade3)) ? 1 : 0;
+    *ptr++ = (all_played & card_bit(spadeA)) ? 1 : 0;
+    for (int i = 0; i < n; i++)
+        *ptr++ = (played_cards_[rel_order[i]] & card_bit(spade3)) ? 1 : 0;
+    for (int i = 0; i < n; i++)
+        *ptr++ = (played_cards_[rel_order[i]] & card_bit(spadeA)) ? 1 : 0;
+
+    // [525:537] phase_flags (12D)
+    bool has_last = state_.last_play.is_play();
+    bool is_free = !has_last && !state_.is_first_turn && !state_.is_declaration_phase;
+    CardSet my_hand_pf = state_.hands[player_id];
+    int my_cnt_pf = popcount64(my_hand_pf);
+    bool must_play = (my_cnt_pf == 1 && has_last);
+
+    *ptr++ = state_.is_declaration_phase ? 1 : 0;  // [0] is_declaration_phase
+    *ptr++ = state_.is_first_turn ? 1 : 0;          // [1] is_first_play_of_game
+    *ptr++ = is_free ? 1 : 0;                       // [2] is_free_lead
+    *ptr++ = (has_last && !must_play) ? 1 : 0;      // [3] can_pass
+    *ptr++ = must_play ? 1 : 0;                     // [4] must_play_if_possible
+    *ptr++ = has_last ? 1 : 0;                       // [5] has_current_top
+    // top_is_single / pair / triple / 5card
+    *ptr++ = (has_last && state_.last_play.size == 1) ? 1 : 0;
+    *ptr++ = (has_last && state_.last_play.size == 2) ? 1 : 0;
+    *ptr++ = (has_last && state_.last_play.size == 3) ? 1 : 0;
+    *ptr++ = (has_last && state_.last_play.size == 5) ? 1 : 0;
+    // pass_count_eq_1 / eq_2
+    *ptr++ = (state_.pass_count == 1) ? 1 : 0;
+    *ptr++ = (state_.pass_count == 2) ? 1 : 0;
+
+    // [537:544] room_rules (7D)
+    *ptr++ = (state_.straight_start_val <= 1) ? 1 : 0;  // start is 3
+    *ptr++ = (state_.straight_start_val >= 2) ? 1 : 0;  // start is 4
+    *ptr++ = (state_.straight_end_val <= 11) ? 1 : 0;   // end is K
+    *ptr++ = (state_.straight_end_val >= 12) ? 1 : 0;   // end is A
+    *ptr++ = 0; // declare_rule_none (reserved)
+    *ptr++ = state_.declare_require_both_spades ? 0 : 1; // free declare
+    *ptr++ = state_.declare_require_both_spades ? 1 : 0; // only s3+sA
+
+    // [544:556] threat_flags (12D)
+    for (int j = 1; j <= 3; j++) {
+        int abs_j = rel_order[j];
+        int cnt_j = popcount64(state_.hands[abs_j]);
+        *ptr++ = (cnt_j == 1) ? 1 : 0;  // eq_1
+    }
+    for (int j = 1; j <= 3; j++) {
+        int abs_j = rel_order[j];
+        int cnt_j = popcount64(state_.hands[abs_j]);
+        *ptr++ = (cnt_j <= 2) ? 1 : 0;  // le_2
+    }
+    for (int j = 1; j <= 3; j++) {
+        int abs_j = rel_order[j];
+        *ptr++ = finished_set.count(abs_j) ? 1 : 0;  // finished
+    }
+    // any_other_eq_1
+    bool any_eq1 = false, any_le2 = false;
+    for (int j = 1; j <= 3; j++) {
+        int cnt_j = popcount64(state_.hands[rel_order[j]]);
+        if (cnt_j == 1) any_eq1 = true;
+        if (cnt_j <= 2) any_le2 = true;
+    }
+    *ptr++ = any_eq1 ? 1 : 0;
+    *ptr++ = any_le2 ? 1 : 0;
+    *ptr++ = (my_cnt_pf == 1) ? 1 : 0;  // self_eq_1
 }
 
-// ======================== Legal Actions ========================
+// ======================== V11 History Encoding ========================
+
+void Engine::encode_hist_tokens(int player_id, int8_t* out) const {
+    int n = NUM_PLAYERS;
+    int rel_order[NUM_PLAYERS];
+    for (int i = 0; i < n; i++) rel_order[i] = (player_id + i) % n;
+
+    int hist_start = std::max(0, (int)action_history_.size() - HISTORY_LEN);
+    int hist_count = (int)action_history_.size() - hist_start;
+
+    int8_t* ptr = out;
+    for (int h = 0; h < hist_count; h++) {
+        encode_hist_token(action_history_[hist_start + h], player_id, rel_order, ptr);
+        ptr += HIST_TOKEN_DIM;
+    }
+    // Remaining slots are already zeroed (valid=0)
+}
+
+void Engine::encode_hist_token(const RichHistoryEntry& entry, int player_id,
+                               const int* rel_order, int8_t* out) const {
+    int8_t* ptr = out;
+
+    // [0:4] actor (4D relative one-hot)
+    for (int i = 0; i < NUM_PLAYERS; i++)
+        if (rel_order[i] == entry.player_id) { ptr[i] = 1; break; }
+    ptr += 4;
+
+    // [4] valid
+    *ptr++ = 1;
+
+    const HandInfo& h = entry.hand;
+
+    // [5] is_pass
+    *ptr++ = h.is_pass() ? 1 : 0;
+
+    // [6:15] action_type (9D one-hot)
+    int ati = hand_type_to_action_idx(h.type);
+    if (ati >= 0 && ati < NUM_ACTION_TYPES) ptr[ati] = 1;
+    ptr += NUM_ACTION_TYPES;
+
+    // [15:28] main_rank (13D one-hot)
+    if (h.is_play() && h.primary_card >= 0)
+        ptr[card_rank(h.primary_card)] = 1;
+    ptr += NUM_RANKS;
+
+    // [28:32] main_suit (4D one-hot)
+    if (h.is_play() && h.primary_card >= 0) {
+        bool encode_suit = (h.type == HAND_SINGLE || h.type == HAND_PAIR ||
+                           h.type == HAND_STRAIGHT || h.type == HAND_FLUSH ||
+                           h.type == HAND_STRAIGHT_FLUSH);
+        if (encode_suit) ptr[card_suit(h.primary_card)] = 1;
+    }
+    ptr += NUM_SUITS;
+
+    // [32:36] action_len (4D one-hot)
+    if (h.is_play()) {
+        int li = hand_size_to_len_idx(h.size);
+        if (li >= 0) ptr[li] = 1;
+    }
+    ptr += 4;
+
+    // [36:88] card_bits (52D)
+    if (h.is_play())
+        for_each_card(h.cards, [&](int c){ ptr[c] = 1; });
+    // ptr += NUM_CARDS; // not needed, caller advances by HIST_TOKEN_DIM
+}
+
+// ======================== V11 Action Feature Encoding ========================
+
+void Engine::encode_action_feature(const HandInfo& hand, int player_id,
+                                   int8_t* out) const {
+    std::memset(out, 0, ACTION_FEAT_DIM);
+    int8_t* ptr = out;
+
+    int spade3 = make_card(3, 12);
+    int spadeA = make_card(3, 10);
+    int diamond4 = make_card(0, 0);
+
+    // [0:52] card_bits
+    if (hand.is_declare()) {
+        for (int i = 0; i < NUM_CARDS; i++) ptr[i] = 1;
+    } else if (hand.is_play()) {
+        for_each_card(hand.cards, [&](int c){ ptr[c] = 1; });
+    }
+    ptr += NUM_CARDS;
+
+    // [52:61] action_type (9D one-hot)
+    int ati = hand_type_to_action_idx(hand.type);
+    if (ati >= 0 && ati < NUM_ACTION_TYPES) ptr[ati] = 1;
+    ptr += NUM_ACTION_TYPES;
+
+    // [61:74] main_rank (13D)
+    if (hand.is_play() && hand.primary_card >= 0)
+        ptr[card_rank(hand.primary_card)] = 1;
+    ptr += NUM_RANKS;
+
+    // [74:78] main_suit (4D)
+    if (hand.is_play() && hand.primary_card >= 0) {
+        bool encode_suit = (hand.type == HAND_SINGLE || hand.type == HAND_PAIR ||
+                           hand.type == HAND_STRAIGHT || hand.type == HAND_FLUSH ||
+                           hand.type == HAND_STRAIGHT_FLUSH);
+        if (encode_suit) ptr[card_suit(hand.primary_card)] = 1;
+    }
+    ptr += NUM_SUITS;
+
+    // [78:82] action_len (4D)
+    if (hand.is_play()) {
+        int li = hand_size_to_len_idx(hand.size);
+        if (li >= 0) ptr[li] = 1;
+    }
+    ptr += 4;
+
+    // [82:90] special_flags (8D)
+    ptr[0] = hand.is_pass() ? 1 : 0;
+    if (hand.is_play()) {
+        ptr[1] = (hand.cards & card_bit(diamond4)) ? 1 : 0;
+        bool has_s3 = (hand.cards & card_bit(spade3)) != 0;
+        bool has_sa = (hand.cards & card_bit(spadeA)) != 0;
+        ptr[2] = has_s3 ? 1 : 0;
+        ptr[3] = has_sa ? 1 : 0;
+
+        // reveals_self_identity: only if identity NOT already public
+        bool s3_already_public = (state_.spade3_player >= 0);
+        bool sa_already_public = (state_.spadeA_player >= 0);
+        bool reveals = (has_s3 && !s3_already_public) || (has_sa && !sa_already_public);
+        ptr[4] = reveals ? 1 : 0;
+
+        CardSet hand_after = state_.hands[player_id] & ~hand.cards;
+        int remaining = popcount64(hand_after);
+        ptr[5] = (remaining == 0) ? 1 : 0;
+        ptr[6] = (remaining == 1) ? 1 : 0;
+
+        // forced_nonpass_context: must play (1 card left and can beat, or free lead)
+        CardSet my = state_.hands[player_id];
+        int my_cnt = popcount64(my);
+        bool cant_pass = state_.last_play.is_pass()
+                         || (my_cnt == 1 && !state_.last_play.is_pass());
+        ptr[7] = cant_pass ? 1 : 0;
+    }
+    ptr += 8;
+
+    // [90:106] afterstate_summary (16D)
+    if (hand.is_play()) {
+        CardSet hand_after = state_.hands[player_id] & ~hand.cards;
+        AfterstateInfo as = compute_afterstate(hand_after,
+            state_.straight_start_val, state_.straight_end_val);
+        ptr[0] = (int8_t)std::min(as.remaining_count, 13);
+        ptr[1] = (as.remaining_count == 1) ? 1 : 0;
+        ptr[2] = (as.remaining_count == 2) ? 1 : 0;
+        ptr[3] = (int8_t)std::min(as.singles_count, 13);
+        ptr[4] = (int8_t)std::min(as.pairs_count, 6);
+        ptr[5] = (int8_t)std::min(as.triples_count, 4);
+        ptr[6] = (int8_t)std::min(as.fivecard_potential, 10);
+        ptr[7] = (int8_t)std::min(as.min_steps, 13);
+        ptr[8] = as.has_s3 ? 1 : 0;
+        ptr[9] = as.has_sa ? 1 : 0;
+        ptr[10] = as.has_rank3_single ? 1 : 0;
+        ptr[11] = as.has_rank2_single ? 1 : 0;
+        ptr[12] = as.has_straight_potential ? 1 : 0;
+        ptr[13] = as.has_flush_potential ? 1 : 0;
+        ptr[14] = as.has_sf_potential ? 1 : 0;
+        ptr[15] = as.has_threepair_or_fourone_potential ? 1 : 0;
+    }
+    ptr += 16;
+
+    // [106:111] rule_aware_straight_features (5D)
+    bool is_straight_fam = (hand.type == HAND_STRAIGHT || hand.type == HAND_STRAIGHT_FLUSH);
+    ptr[0] = is_straight_fam ? 1 : 0;
+    if (is_straight_fam && hand.is_play()) {
+        int min_srv = 99, max_srv = 0;
+        for_each_card(hand.cards, [&](int c) {
+            int v = STRAIGHT_RANK_VAL[card_rank(c)];
+            if (v < min_srv) min_srv = v;
+            if (v > max_srv) max_srv = v;
+        });
+        int room_min = state_.straight_start_val;
+        int room_max = state_.straight_end_val;
+
+        ptr[1] = (min_srv == room_min) ? 1 : 0; // touches min boundary
+        ptr[2] = (max_srv == room_max) ? 1 : 0; // touches max boundary
+        ptr[3] = (max_srv == room_max && min_srv == room_max - 4) ? 1 : 0; // room max straight
+        ptr[4] = (min_srv == room_min && max_srv == room_min + 4) ? 1 : 0; // room min straight
+    }
+}
+
+// ======================== Legal Actions (V11) ========================
 
 std::vector<Engine::ActionEntry> Engine::get_legal_actions() const {
     std::vector<ActionEntry> result;
-
-    if (state_.is_declaration_phase) {
-        ActionEntry decl;
-        decl.key = "declare";
-        std::memset(decl.feature, 1, ACTION_DIM); // all-ones
-        result.push_back(decl);
-
-        ActionEntry pass;
-        pass.key = "pass";
-        std::memset(pass.feature, 0, ACTION_DIM);
-        result.push_back(pass);
-        return result;
-    }
+    int pid = get_player_id();
 
     auto moves = state_.get_legal_moves();
     for (auto& h : moves) {
         ActionEntry ae;
         ae.key = h.to_key();
-        h.to_feature(ae.feature);
+        encode_action_feature(h, pid, ae.feature);
         key_to_hand_[ae.key] = h;
         result.push_back(ae);
     }
@@ -1207,20 +1717,24 @@ std::vector<Engine::ActionEntry> Engine::get_legal_actions() const {
 }
 
 void Engine::get_action_feature(const std::string& key, int8_t* out) const {
-    std::memset(out, 0, ACTION_DIM);
+    int pid = get_player_id();
     if (key == "declare") {
-        std::memset(out, 1, ACTION_DIM);
+        HandInfo decl; decl.type = HAND_DECLARE;
+        encode_action_feature(decl, pid, out);
         return;
     }
-    if (key == "pass" || key.empty()) return;
+    if (key == "pass" || key.empty()) {
+        HandInfo pass;
+        encode_action_feature(pass, pid, out);
+        return;
+    }
     auto it = key_to_hand_.find(key);
     if (it != key_to_hand_.end()) {
-        it->second.to_feature(out);
+        encode_action_feature(it->second, pid, out);
         return;
     }
-    // Parse key
     HandInfo h = resolve_action(key);
-    if (h.is_play()) h.to_feature(out);
+    encode_action_feature(h, pid, out);
 }
 
 // ======================== Rule Agent ========================
@@ -1229,7 +1743,6 @@ std::string Engine::greedy_action() const {
     if (state_.is_declaration_phase) return "pass";
 
     auto moves = state_.get_legal_moves();
-    // Separate plays and pass
     std::vector<HandInfo> plays;
     for (auto& h : moves)
         if (h.is_play()) plays.push_back(h);
@@ -1240,13 +1753,11 @@ std::string Engine::greedy_action() const {
     int my_count = popcount64(my);
 
     if (state_.last_play.is_pass()) {
-        // Free play
         if (my_count == 1) return plays[0].to_key();
         if (my_count == 2) {
             for (auto& h : plays)
                 if (h.size == 2) return h.to_key();
         }
-        // Smallest single
         std::sort(plays.begin(), plays.end(), [](const HandInfo& a, const HandInfo& b){
             return card_score(a.primary_card) < card_score(b.primary_card);
         });
@@ -1255,7 +1766,6 @@ std::string Engine::greedy_action() const {
         return plays[0].to_key();
     }
 
-    // Follow play - check if teammate
     int lpp = state_.last_play_player;
     Team my_team = state_.observed_teams[pid];
     Team opp_team = (lpp >= 0) ? state_.observed_teams[lpp] : TEAM_UNKNOWN;
@@ -1265,7 +1775,6 @@ std::string Engine::greedy_action() const {
                                   [](const HandInfo& hand) { return hand.is_pass(); }))
         return "pass";
 
-    // Play smallest beater
     std::sort(plays.begin(), plays.end(), [](const HandInfo& a, const HandInfo& b){
         return card_score(a.primary_card) < card_score(b.primary_card);
     });
@@ -1273,10 +1782,6 @@ std::string Engine::greedy_action() const {
 }
 
 std::string Engine::random_action() const {
-    if (state_.is_declaration_phase) {
-        std::uniform_int_distribution<int> dist(0, 1);
-        return dist(rng_) == 0 ? "declare" : "pass";
-    }
     auto moves = state_.get_legal_moves();
     if (moves.empty()) return "pass";
     std::uniform_int_distribution<int> dist(0, (int)moves.size() - 1);
@@ -1305,6 +1810,9 @@ void VectorizedEngine::seed(unsigned int base) {
 }
 
 int  VectorizedEngine::reset(int i)                          { return engines_[i].reset(); }
+void VectorizedEngine::set_rules(int i, bool both, int start, int end) {
+    engines_[i].set_rules(both, start, end);
+}
 int  VectorizedEngine::step(int i, const std::string& k)     { return engines_[i].step(k); }
 int  VectorizedEngine::get_player_id(int i)           const  { return engines_[i].get_player_id(); }
 bool VectorizedEngine::is_over(int i)                 const  { return engines_[i].is_over(); }
@@ -1319,13 +1827,19 @@ void VectorizedEngine::get_action_feature(int i, const std::string& k, int8_t* o
     engines_[i].get_action_feature(k, out);
 }
 
+std::array<float, NUM_PLAYERS> VectorizedEngine::get_payoffs(int i) const {
+    return engines_[i].get_payoffs();
+}
 std::array<float, NUM_PLAYERS> VectorizedEngine::get_training_payoffs(int i) const {
     return engines_[i].get_training_payoffs();
 }
 const std::vector<float>& VectorizedEngine::get_step_rewards(int i, int p) const {
     return engines_[i].get_step_rewards(p);
 }
-std::array<std::array<int64_t,3>,NUM_PLAYERS> VectorizedEngine::get_aux_targets(int i) const {
+Engine::AuxTargets VectorizedEngine::get_aux_targets_for_player(int idx, int pid) const {
+    return engines_[idx].get_aux_targets()[pid];
+}
+std::array<Engine::AuxTargets,NUM_PLAYERS> VectorizedEngine::get_aux_targets(int i) const {
     return engines_[i].get_aux_targets();
 }
 
@@ -1342,6 +1856,7 @@ VectorizedEngine::advance_to_decision(int idx) {
 
         std::string key = engines_[idx].get_rule_agent_action();
         engines_[idx].get_action_feature(key, sd.action);
+        sd.auxiliary = engines_[idx].get_aux_targets()[pid];
         engines_[idx].step(key);
         steps.push_back(sd);
     }
@@ -1366,7 +1881,6 @@ VectorizedEngine::prepare_batch(const std::vector<int>& pending) const {
     bd.action_keys.reserve(K);
 
     int est = K * 20;
-    bd.obs_expanded.reserve(est * STATE_DIM);
     bd.action_flat.reserve(est * ACTION_DIM);
 
     for (int idx = 0; idx < K; idx++) {
@@ -1381,8 +1895,6 @@ VectorizedEngine::prepare_batch(const std::vector<int>& pending) const {
         keys.reserve(actions.size());
 
         for (auto& a : actions) {
-            bd.obs_expanded.insert(bd.obs_expanded.end(),
-                                   obs_ptr, obs_ptr + STATE_DIM);
             bd.action_flat.insert(bd.action_flat.end(),
                                   a.feature, a.feature + ACTION_DIM);
             keys.push_back(std::move(a.key));

@@ -49,7 +49,75 @@ def score_actions(agent, observations, actions, max_actions, model_lock):
             obs = torch.as_tensor(observations[start:end], device=agent.device).float()
             act = torch.as_tensor(actions[start:end], device=agent.device).float()
             outputs.append(agent.forward(obs, act))
-        return torch.cat(outputs).cpu().numpy()
+        return torch.cat(outputs).float().cpu().numpy()
+
+
+def score_action_groups(agent, observations, actions, offsets, max_actions, model_lock):
+    """Transfer unique states once, then score variable-sized candidate groups."""
+    offsets = np.asarray(offsets, dtype=np.int64)
+    counts = np.diff(offsets)
+    if len(offsets) != len(observations) + 1 or offsets[0] != 0 or offsets[-1] != len(actions) or np.any(counts <= 0):
+        raise ValueError('Offsets must cover one nonempty candidate group per state')
+    mapping = np.repeat(np.arange(len(observations)), counts)
+    net = agent.net
+    outputs = []
+    dtype = getattr(agent, 'inference_dtype', None)
+    amp = torch.autocast('cuda', dtype=dtype) if dtype is not None else contextlib.nullcontext()
+    with model_lock, torch.no_grad(), amp:
+        obs = torch.as_tensor(observations, device=agent.device).float()
+        reusable = hasattr(net, 'encode_state')
+        encoded = net.encode_state(obs) if reusable else None
+        # Known phase routing avoids CUDA nonzero synchronization in actor forwards.
+        phase_column = getattr(net, 'declaration_flag_index', None)
+        declaration = np.asarray(observations)[:, phase_column] > .5 if reusable and phase_column is not None else None
+        for start in range(0, len(actions), max_actions):
+            end = min(start + max_actions, len(actions))
+            indices = mapping[start:end]
+            index = torch.as_tensor(indices, device=agent.device, dtype=torch.long)
+            act = torch.as_tensor(actions[start:end], device=agent.device).float()
+            if not reusable:
+                output = agent.forward(obs.index_select(0, index), act)
+            elif declaration is None:
+                output = net.score_encoded(encoded, act, index)
+            else:
+                output = torch.empty(end - start, device=agent.device, dtype=obs.dtype)
+                for is_declare, phase in ((False, 'play'), (True, 'declare')):
+                    rows = np.flatnonzero(declaration[indices] == is_declare)
+                    if not len(rows):
+                        continue
+                    selected = torch.as_tensor(rows, device=agent.device, dtype=torch.long)
+                    values = net.score_encoded(encoded, act.index_select(0, selected),
+                                               index.index_select(0, selected), phase=phase)
+                    output.index_copy_(0, selected, values.to(output.dtype))
+            outputs.append(output)
+        return torch.cat(outputs).float().cpu().numpy()
+
+
+def choose_action_indices(agent, observations, actions, offsets, epsilon, max_actions, model_lock):
+    """Forced and exploratory decisions do not need a value-network forward."""
+    offsets = np.asarray(offsets, dtype=np.int64)
+    counts = np.diff(offsets)
+    if len(offsets) != len(observations) + 1 or offsets[0] != 0 or offsets[-1] != len(actions):
+        raise ValueError('Offsets do not match observations and actions')
+    choices = np.empty(len(counts), dtype=np.int64)
+    pending = []
+    for i, count in enumerate(counts):
+        if count <= 0:
+            raise ValueError('Each decision must have a legal action')
+        if count == 1:
+            choices[i] = 0
+        elif np.random.random() < epsilon:
+            choices[i] = np.random.randint(count)
+        else:
+            pending.append(i)
+    if pending:
+        selected_actions = np.concatenate([actions[offsets[i]:offsets[i + 1]] for i in pending])
+        selected_offsets = np.cumsum([0] + [int(counts[i]) for i in pending])
+        values = score_action_groups(agent, np.asarray(observations)[pending], selected_actions,
+                                     selected_offsets, max_actions, model_lock)
+        for row, i in enumerate(pending):
+            choices[i] = values[selected_offsets[row]:selected_offsets[row + 1]].argmax()
+    return choices
 
 
 class RLCardAdapter:
@@ -74,6 +142,9 @@ class RLCardAdapter:
 
     def episode_data(self):
         return self.env.get_payoffs(), None, None
+
+    def decision_labels(self, player):
+        return None
 
 
 class PettingZooAdapter:
@@ -116,6 +187,9 @@ class PettingZooAdapter:
     def episode_data(self):
         return [0.] * self.num_players, self.rewards, None
 
+    def decision_labels(self, player):
+        return None
+
 
 class PythonPool:
     def __init__(self, env, count, seed, adapter_class, max_episode_steps):
@@ -151,17 +225,12 @@ class PythonPool:
 
         for entries in groups.values():
             agent = model.get_agent(entries[0][1])
-            observations = np.concatenate([np.repeat(obs[None], len(keys), axis=0)
-                                           for _, _, obs, keys, _ in entries])
+            observations = np.stack([obs for _, _, obs, _, _ in entries])
             actions = np.concatenate([features for _, _, _, _, features in entries])
-            values = score_actions(agent, observations, actions, max_actions, model_lock)
-            offset = 0
-            for i, p, obs, keys, features in entries:
-                count = len(keys)
-                choice = (np.random.randint(count) if np.random.random() < epsilon
-                          else int(values[offset:offset + count].argmax()))
+            offsets = np.cumsum([0] + [len(keys) for _, _, _, keys, _ in entries])
+            choices = choose_action_indices(agent, observations, actions, offsets, epsilon, max_actions, model_lock)
+            for (i, p, obs, keys, features), choice in zip(entries, choices):
                 self._step(i, p, obs, keys[choice], features[choice])
-                offset += count
                 num_steps += 1
 
         for i, env in enumerate(self.envs):
@@ -173,7 +242,9 @@ class PythonPool:
         return finished, num_steps
 
     def _step(self, i, p, obs, action, feature):
-        self.steps[i][p].append((np.asarray(obs).copy(), feature.copy()))
+        labels = self.envs[i].decision_labels(p)
+        record = (np.asarray(obs).copy(), feature.copy())
+        self.steps[i][p].append(record if labels is None else record + (np.asarray(labels).copy(),))
         self.states[i] = self.envs[i].step(action)
         self.lengths[i] += 1
         if self.lengths[i] > self.max_episode_steps:
@@ -183,24 +254,24 @@ class PythonPool:
 def actor_worker(actor_id, seed, env, model, model_lock, buffers,
                  free_queues, full_queues, stop, epsilon, errors, counters,
                  T, count, backend, adapter_class, max_actions, max_episode_steps,
-                 inference_device='cpu', policy_version=None):
+                 inference_device='cpu', policy_version=None, precision='fp32'):
     try:
         torch.set_num_threads(1)
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
         shared_model = model
-        local_version = -1
-        inference_lock = model_lock
+        # All workers own their inference model. CPU actors can infer concurrently.
+        with model_lock:
+            model = copy.deepcopy(shared_model)
+            local_version = policy_version.value
+        inference_lock = contextlib.nullcontext()
         if inference_device != 'cpu':
-            # CUDA models belong to their worker. Only CPU snapshots cross processes.
-            with model_lock:
-                model = copy.deepcopy(shared_model)
-                local_version = policy_version.value
             for agent in {id(a): a for a in model.get_agents()}.values():
                 agent.device = 'cuda:' + str(inference_device)
                 agent.net.to(agent.device)
-            inference_lock = contextlib.nullcontext()
+                agent.inference_dtype = (torch.bfloat16 if precision == 'bf16'
+                                         else torch.float16 if precision == 'fp16' else None)
         if backend == 'cpp':
             from rlcard.envs.a3dizhu.dmc import NativePool
             pool = NativePool(env() if callable(env) else env, count, seed, max_episode_steps)
@@ -208,7 +279,7 @@ def actor_worker(actor_id, seed, env, model, model_lock, buffers,
             pool = PythonPool(env, count, seed, adapter_class, max_episode_steps)
         writer = TrajectoryWriter(T, free_queues, full_queues, buffers)
         while not stop.is_set():
-            if inference_device != 'cpu' and policy_version.value != local_version:
+            if policy_version.value != local_version:
                 with model_lock:
                     for p in ([0] if model.shared else range(len(model.get_agents()))):
                         model.get_agent(p).load_state_dict(shared_model.get_agent(p).state_dict())

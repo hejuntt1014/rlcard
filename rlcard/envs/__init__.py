@@ -52,3 +52,8 @@ register(
     env_id='a3dizhu',
     entry_point='rlcard.envs.a3dizhu.env:A3DizhuEnv',
 )
+
+register(
+    env_id='a3dizhu-v12',
+    entry_point='rlcard.envs.a3dizhu.v12:A3ContextEnv',
+)

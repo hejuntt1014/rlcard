@@ -121,10 +121,15 @@ class DMCAgent:
         device="0",
         architecture='mlp',
         aux_classes=(),
+        history_encoder='mlp',
     ):
         self.use_raw = False
         self.device = 'cuda:' + device if device != "cpu" else "cpu"
-        self.net = DMCNet(state_shape, action_shape, mlp_layers, architecture, aux_classes).to(self.device)
+        if architecture == 'context':
+            from .context_model import ContextDMCNet
+            self.net = ContextDMCNet(state_shape, action_shape, mlp_layers, history_encoder, aux_classes).to(self.device)
+        else:
+            self.net = DMCNet(state_shape, action_shape, mlp_layers, architecture, aux_classes).to(self.device)
         self.exp_epsilon = exp_epsilon
         self.action_shape = action_shape
 
@@ -157,19 +162,12 @@ class DMCAgent:
 
     @torch.no_grad()
     def predict(self, state):
-        obs = state['obs'].astype(np.float32)
-        legal_actions = state['legal_actions']
-        action_keys = np.array(list(legal_actions.keys()))
-        action_values = list(legal_actions.values())
-        for i in range(len(action_values)):
-            if action_values[i] is None:
-                action_values[i] = np.zeros(self.action_shape[0])
-                action_values[i][action_keys[i]] = 1
-        action_values = np.array(action_values, dtype=np.float32)
-        obs = np.repeat(obs[np.newaxis, :], len(action_keys), axis=0)
-        values = self.net.forward(torch.from_numpy(obs).to(self.device),
-                                  torch.from_numpy(action_values).to(self.device))
-        return action_keys, values.cpu().detach().numpy()
+        from contextlib import nullcontext
+        from .collector import action_features, score_action_groups
+        keys, features = action_features(state, self.action_shape)
+        values = score_action_groups(self, np.asarray(state['obs'])[None], features,
+                                     [0, len(keys)], 4096, nullcontext())
+        return np.asarray(keys), values
 
     def forward(self, obs, actions):
         return self.net.forward(obs, actions)
@@ -199,6 +197,7 @@ class DMCModel:
         share_weights=False,
         architecture='mlp',
         aux_classes=(),
+        history_encoder='mlp',
     ):
         self.shared = share_weights
         num_players = len(state_shape)
@@ -211,6 +210,7 @@ class DMCModel:
                 state_shape[0], action_shape[0],
                 mlp_layers, exp_epsilon, str(device),
                 architecture, aux_classes,
+                history_encoder,
             )
             self.agents = [agent for _ in range(num_players)]
         else:
@@ -220,6 +220,7 @@ class DMCModel:
                     state_shape[pid], action_shape[pid],
                     mlp_layers, exp_epsilon, str(device),
                     architecture, aux_classes,
+                    history_encoder,
                 ))
 
     def share_memory(self):

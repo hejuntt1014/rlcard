@@ -2,6 +2,8 @@
 '''
 import os
 import argparse
+import json
+import logging
 
 import torch
 
@@ -12,8 +14,11 @@ def train(args):
 
     # Make the environment
     config = {'seed': args.seed}
-    if args.env == 'a3dizhu':
+    if args.env in ('a3dizhu', 'a3dizhu-v12'):
         config['backend'] = args.backend
+    if args.env == 'a3dizhu-v12':
+        config['reward_mode'] = args.reward_mode
+        config['rules'] = json.loads(args.rules) if args.rules else None
     env = rlcard.make(args.env, config=config)
 
     # Initialize the DMC trainer
@@ -40,6 +45,11 @@ def train(args):
         mlp_layers=args.hidden_sizes,
         weight_sync_interval=args.weight_sync_interval,
         actor_on_cpu=args.actor_on_cpu,
+        history_encoder=args.history_encoder,
+        precision=args.precision,
+        initial_epsilon=args.initial_epsilon,
+        final_epsilon=args.final_epsilon,
+        learning_rate=args.learning_rate,
     )
 
     # Train DMC Agents
@@ -60,7 +70,8 @@ if __name__ == '__main__':
             'no-limit-holdem',
             'uno',
             'gin-rummy',
-            'a3dizhu'
+            'a3dizhu',
+            'a3dizhu-v12'
         ],
     )
     parser.add_argument(
@@ -116,13 +127,21 @@ if __name__ == '__main__':
     parser.add_argument('--backend', choices=['auto', 'python', 'cpp'], default='auto')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--share_weights', action='store_true')
-    parser.add_argument('--architecture', choices=['mlp', 'resnet'])
+    parser.add_argument('--architecture', choices=['mlp', 'resnet', 'context'])
     parser.add_argument('--auxiliary', action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument('--hidden_sizes', type=int, nargs='+', default=[512] * 5)
+    parser.add_argument('--hidden_sizes', type=int, nargs='+')
+    parser.add_argument('--history_encoder', choices=['mlp', 'transformer'], default='mlp')
+    parser.add_argument('--precision', choices=['fp32', 'bf16', 'fp16'], default='fp32')
+    parser.add_argument('--initial_epsilon', type=float)
+    parser.add_argument('--final_epsilon', type=float)
+    parser.add_argument('--learning_rate', type=float, default=.0001)
+    parser.add_argument('--reward_mode', choices=['game', 'shaped'], default='game')
+    parser.add_argument('--rules', help='JSON object with all three A3 rule settings; omitted means random rules')
     parser.add_argument('--weight_sync_interval', type=int, default=50)
     parser.add_argument('--cpu_threads', type=int, default=1)
     parser.add_argument('--actor_on_cpu', action='store_true')
     args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     torch.set_num_threads(args.cpu_threads)
 
     os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda

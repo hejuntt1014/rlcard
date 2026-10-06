@@ -155,7 +155,7 @@ class TestDMC(unittest.TestCase):
                 break
         self.assertTrue(finished)
         trajectory, _, rewards, _ = finished[0]
-        self.assertTrue(any(np.any(a) for steps in trajectory for _, a in steps))
+        self.assertTrue(any(np.any(step[1]) for steps in trajectory for step in steps))
         for p in range(4):
             self.assertEqual(len(trajectory[p]), len(rewards[p]))
 
@@ -186,7 +186,7 @@ class TestDMC(unittest.TestCase):
         episodes, _ = pool.round(model, .1, 64, contextlib.nullcontext())
         self.assertTrue(episodes)
         for steps, _, rewards, _ in episodes:
-            self.assertTrue(any(np.any(a) for role in steps for _, a in role))
+            self.assertTrue(any(np.any(step[1]) for role in steps for step in role))
             self.assertEqual([len(s) for s in steps], list(map(len, rewards)))
         with tempfile.TemporaryDirectory() as path:
             trainer = DMCTrainer(rlcard.make('a3dizhu', config={'greedy_ratio': .5}),

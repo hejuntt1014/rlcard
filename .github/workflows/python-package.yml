@@ -26,6 +26,6 @@ jobs:
       - name: Build native backend
         run: python setup_cpp.py build_ext --inplace
       - name: Native integration tests
-        run: python -X utf8 -m pytest tests/agents/test_dmc.py -q
+        run: python -X utf8 -m pytest tests/agents tests/games/test_a3_v12_native.py -q
       - name: Native parity
         run: python -X utf8 test_parity.py

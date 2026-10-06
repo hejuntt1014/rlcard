@@ -50,12 +50,13 @@ def create_buffers(T, num_buffers, state_shape, action_shape, device_iterator,
 
 class BatchReader:
     """One consumer; hold partial batches locally instead of requeueing them."""
-    def __init__(self, free_queue, full_queue, buffers, batch_size):
+    def __init__(self, free_queue, full_queue, buffers, batch_size, batch_major=False):
         self.free_queue = free_queue
         self.full_queue = full_queue
         self.buffers = buffers
         self.batch_size = batch_size
         self.pending = []
+        self.batch_major = batch_major
 
     def get(self):
         while len(self.pending) < self.batch_size:
@@ -64,8 +65,9 @@ class BatchReader:
             except Empty:
                 return None
         indices = torch.tensor(self.pending, dtype=torch.long)
-        batch = {key: value.index_select(0, indices).transpose(0, 1).contiguous()
-                 for key, value in self.buffers.items()}
+        batch = {key: value.index_select(0, indices) for key, value in self.buffers.items()}
+        if not self.batch_major:
+            batch = {key: value.transpose(0, 1).contiguous() for key, value in batch.items()}
         for index in self.pending:
             self.free_queue.put(index)
         self.pending = []
@@ -105,9 +107,12 @@ class TrajectoryWriter:
             out['done'].extend([False] * (n - 1) + [True])
             out['episode_return'].extend([0.] * (n - 1) + [float(payoffs[p]) + sum(sr)])
             if 'aux_target' in out:
-                if auxiliary is None:
+                if all(len(step) >= 3 for step in trajectory):
+                    out['aux_target'].extend(step[2] for step in trajectory)
+                elif auxiliary is None:
                     raise ValueError('Auxiliary task enabled but episode has no labels')
-                out['aux_target'].extend([auxiliary[p]] * n)
+                else:
+                    out['aux_target'].extend([auxiliary[p]] * n)
 
     def flush(self):
         for p, data in enumerate(self.pending):

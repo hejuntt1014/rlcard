@@ -14,7 +14,7 @@ Original source-file copyright and attribution notices are retained.
 
 The following source files carry Apache License 2.0 notices:
 
-- `rlcard/agents/dmc_agent/model.py`, `trainer.py`, and `utils.py`:
+- `rlcard/agents/dmc_agent/model.py`, `context_model.py`, `trainer.py`, and `utils.py`:
   Copyright 2021 RLCard Team of Texas A&M University;
   Copyright 2021 DouZero Team of Kwai.
 - `rlcard/agents/dmc_agent/file_writer.py`:

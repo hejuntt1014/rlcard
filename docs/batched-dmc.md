@@ -4,6 +4,9 @@ DMC supports batches of independent card games in each actor process. Decisions
 are grouped by policy, legal state-action pairs are scored together, and a single
 learner consumes fixed-length trajectory blocks from CPU shared memory.
 
+The [A3 context policy](a3-context.md) provides structured history, reusable state
+encoding, independent declaration scoring, and optional mixed precision.
+
 ## Install
 
 Python 3.10 or later is required. Check out the training branch:
@@ -119,10 +122,10 @@ are not accepted by this adapter.
 Weight sharing is inappropriate for differently shaped roles such as the landlord
 and farmers in standard Dou Dizhu. Equal shapes alone do not establish game
 symmetry. `num_threads` is accepted by the trainer, but the learner uses one update
-loop. Policy publication uses versioned CPU snapshots and per-device locks. GPU
-actors keep local CUDA models and refresh them from published snapshots, so CUDA
-tensors do not cross process boundaries. CPU actors read the shared policy under
-the same lock used for publication.
+loop. Policy publication uses versioned CPU snapshots and per-device locks. All
+actors keep local inference models and refresh them from published snapshots.
+CPU actor forwards can run concurrently, and CUDA tensors do not cross process
+boundaries. Locks protect snapshot refresh rather than model inference.
 
 Increase pool sizes while the learner lacks data, then measure again. More actors
 or larger batches are not guaranteed to improve throughput. Queue backpressure

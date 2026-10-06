@@ -32,11 +32,21 @@ ext_modules = [
             os.path.join(cpp_dir, "bindings.cpp"),
         ],
         include_dirs=[cpp_dir],
+        depends=[os.path.join(cpp_dir, 'a3dizhu.h')],
         cxx_std=17,
         define_macros=[("NDEBUG", "1")],
         extra_compile_args=['/utf-8'] if sys.platform == 'win32' else [],
     ),
 ]
+
+v12_dir = os.path.join(cpp_dir, 'a3_v12')
+ext_modules.append(Pybind11Extension(
+    'a3dizhu_v12_cpp',
+    sources=[os.path.join(v12_dir, 'a3dizhu.cpp'), os.path.join(v12_dir, 'bindings.cpp')],
+    include_dirs=[v12_dir], depends=[os.path.join(v12_dir, 'a3dizhu.h')],
+    cxx_std=17, define_macros=[('NDEBUG', '1')],
+    extra_compile_args=['/utf-8'] if sys.platform == 'win32' else [],
+))
 
 setup(
     name="a3dizhu_cpp",

@@ -30,15 +30,34 @@ inline int popcount64(uint64_t x) { return __builtin_popcountll(x); }
 inline int ctz64(uint64_t x) { return __builtin_ctzll(x); }
 #endif
 
-// ======================== Constants ========================
+// ======================== Card Constants ========================
 constexpr int NUM_PLAYERS   = 4;
+constexpr int NUM_OPPONENTS = 3;
 constexpr int NUM_SUITS     = 4;
 constexpr int NUM_RANKS     = 13;
 constexpr int NUM_CARDS     = 52;
-constexpr int STATE_DIM     = 850;
-constexpr int ACTION_DIM    = 52;
-constexpr int HISTORY_LEN   = 8;
-constexpr int HISTORY_STEP_DIM = 4 + 1 + NUM_CARDS; // 57
+
+// ======================== V11 Encoding Dimensions ========================
+//
+// obs_static (556D) + hist_tokens (24 × 88D = 2112D) = 2668D
+// action_feat = 111D
+// total flat input = 2668 + 111 = 2779D
+//
+constexpr int HISTORY_LEN      = 24;
+constexpr int HIST_TOKEN_DIM   = 88;    // 4+1+1+9+13+4+4+52
+constexpr int OBS_STATIC_DIM   = 556;
+constexpr int ACTION_FEAT_DIM  = 111;
+
+constexpr int STATE_DIM   = OBS_STATIC_DIM + HISTORY_LEN * HIST_TOKEN_DIM;  // 2668
+constexpr int ACTION_DIM  = ACTION_FEAT_DIM;                                // 111
+
+// Aux: relation(9) + s3_owner(4) + sa_owner(4) = 17
+constexpr int AUX_DIM = NUM_OPPONENTS * 3 + 4 + 4;  // 17
+
+// Action type one-hot (9 categories)
+constexpr int NUM_ACTION_TYPES = 9;
+// [single=0, pair=1, triple=2, straight=3, flush=4,
+//  full_house=5, four_with_one=6, straight_flush=7, pass=8]
 
 // Suit: 0=diamond, 1=club, 2=heart, 3=spade
 // Rank: 0='4', 1='5', ..., 9='K', 10='A', 11='2', 12='3'
@@ -55,13 +74,11 @@ inline int card_score(int c) { return card_rank(c) * 10 + card_suit(c); }
 // Straight rank values: '3'=1, '4'=2, '5'=3, ..., 'A'=12, '2'=0(invalid)
 extern const int STRAIGHT_RANK_VAL[NUM_RANKS];
 
-// All 4 cards of a given rank
 inline CardSet rank_mask(int rank) {
     return card_bit(rank) | card_bit(NUM_RANKS + rank)
          | card_bit(2 * NUM_RANKS + rank) | card_bit(3 * NUM_RANKS + rank);
 }
 
-// All 13 cards of a given suit
 inline CardSet suit_mask(int suit) {
     return ((1ULL << NUM_RANKS) - 1) << (suit * NUM_RANKS);
 }
@@ -72,7 +89,6 @@ extern const char* RANK_NAMES[NUM_RANKS];
 std::string card_to_string(int card);
 int         string_to_card(const std::string& s);
 
-// Iterate set bits
 template<typename Fn>
 inline void for_each_card(CardSet cs, Fn fn) {
     while (cs) {
@@ -82,11 +98,30 @@ inline void for_each_card(CardSet cs, Fn fn) {
     }
 }
 
-// Collect set bits into vector
 inline std::vector<int> cards_vec(CardSet cs) {
     std::vector<int> v;
     for_each_card(cs, [&](int c){ v.push_back(c); });
     return v;
+}
+
+// ======================== Action Type Helpers ========================
+
+inline int hand_type_to_action_idx(int type) {
+    // HAND_SINGLE=0..HAND_STRAIGHT_FLUSH=7 map directly
+    // HAND_PASS=-2 maps to 8
+    if (type >= 0 && type <= 7) return type;
+    if (type == -2) return 8; // pass
+    return -1;
+}
+
+inline int hand_size_to_len_idx(int size) {
+    switch (size) {
+        case 1: return 0;
+        case 2: return 1;
+        case 3: return 2;
+        case 5: return 3;
+        default: return -1;
+    }
 }
 
 // ======================== Hand Types ========================
@@ -125,8 +160,29 @@ struct HandInfo {
     bool is_play()    const { return type >= HAND_SINGLE; }
 
     std::string to_key() const;
-    void to_feature(int8_t* out) const; // 52-dim
+    void to_card_bits(int8_t* out52) const;
 };
+
+// ======================== Afterstate Summary ========================
+
+struct AfterstateInfo {
+    int remaining_count;
+    int singles_count;
+    int pairs_count;
+    int triples_count;
+    int fivecard_potential;
+    int min_steps;
+    bool has_s3;
+    bool has_sa;
+    bool has_rank3_single;
+    bool has_rank2_single;
+    bool has_straight_potential;
+    bool has_flush_potential;
+    bool has_sf_potential;
+    bool has_threepair_or_fourone_potential;
+};
+
+AfterstateInfo compute_afterstate(CardSet hand_after, int start_val, int end_val);
 
 // ======================== Hand Detection & Comparison ========================
 HandInfo detect_hand(CardSet cards, int size);
@@ -134,8 +190,8 @@ int  compare_hands(const HandInfo& a, const HandInfo& b);
 bool can_beat(const HandInfo& a, const HandInfo& b);
 
 // ======================== Legal Move Enumeration ========================
-std::vector<HandInfo> get_all_hands(CardSet my_cards);
-std::vector<HandInfo> get_beating_hands(CardSet my_cards, const HandInfo& last);
+std::vector<HandInfo> get_all_hands(CardSet my_cards, int start_val = 1, int end_val = 12);
+std::vector<HandInfo> get_beating_hands(CardSet my_cards, const HandInfo& last, int start_val = 1, int end_val = 12);
 
 // ======================== Team ========================
 enum Team : int8_t {
@@ -167,6 +223,11 @@ struct GameState {
     bool is_declared          = false;
     int  declarant            = -1;
 
+    // Rule variants (randomized each game)
+    bool declare_require_both_spades = false;
+    int  straight_start_val = 1;   // STRAIGHT_RANK_VAL range: 1=from 3, 2=from 4
+    int  straight_end_val   = 12;  // 11=up to K, 12=up to A
+
     // Observed teams (computed from spade tracking)
     Team observed_teams[NUM_PLAYERS];
 
@@ -190,6 +251,12 @@ float compute_step_reward(
     const GameState& next, int player_id);
 
 // ======================== Engine (full env) ========================
+
+struct RichHistoryEntry {
+    int      player_id;
+    HandInfo hand;
+};
+
 class Engine {
 public:
     Engine();
@@ -198,14 +265,12 @@ public:
     void set_random_ratio(double r) { random_ratio_ = r; }
     void seed(unsigned int s);
 
-    int  reset();                                // returns first player_id
-    // Reset with specific hands (for parity testing against Python engine)
-    // hands: 4 × 13 card id strings, e.g. "spade_A"
-    // start_player: the player holding diamond_4
+    int  reset();
     int  reset_with_hands(
         const std::vector<std::vector<std::string>>& hands,
         int start_player);
-    int  step(const std::string& action_key);    // returns next player_id
+    void set_rules(bool declare_require_both_spades, int straight_start_val, int straight_end_val);
+    int  step(const std::string& action_key);
 
     int  get_player_id()        const;
     bool is_over()              const;
@@ -216,11 +281,13 @@ public:
     }
     bool is_rule_agent_seat(int pid) const;
 
+    // V11: encode obs_static(556D) + hist_tokens(24×88D) = 2668D flat
     void encode_obs(int player_id, int8_t* out) const;
 
+    // V11: ActionEntry now has 111D feature (card_bits + type + rank + suit + len + flags + afterstate + rule_straight)
     struct ActionEntry {
         std::string key;
-        int8_t feature[ACTION_DIM];
+        int8_t feature[ACTION_FEAT_DIM];
     };
     std::vector<ActionEntry> get_legal_actions() const;
 
@@ -231,7 +298,14 @@ public:
     std::array<float,NUM_PLAYERS> get_payoffs()          const;
     std::array<float,NUM_PLAYERS> get_training_payoffs()  const;
     const std::vector<float>&     get_step_rewards(int p) const;
-    std::array<std::array<int64_t,3>,NUM_PLAYERS> get_aux_targets() const;
+
+    // V11 aux targets: relation(3×int64) + s3_owner(int64) + sa_owner(int64)
+    struct AuxTargets {
+        std::array<int64_t, 3> relation;  // 1=same_side, 2=opposite, -1=unknown
+        int64_t s3_owner;  // relative slot of ♠3 holder (-1 if unknown)
+        int64_t sa_owner;  // relative slot of ♠A holder (-1 if unknown)
+    };
+    std::array<AuxTargets, NUM_PLAYERS> get_aux_targets() const;
 
     const GameState& game_state() const { return state_; }
 
@@ -239,10 +313,13 @@ private:
     GameState state_;
     GameState prev_state_;
 
-    struct HistoryEntry { int player_id; CardSet cards; };
-    std::vector<HistoryEntry> action_history_;
+    std::vector<RichHistoryEntry> action_history_;
     CardSet played_cards_[NUM_PLAYERS];
     std::vector<float> step_rewards_[NUM_PLAYERS];
+
+    // V11: last non-pass action tracking (persists across round resets)
+    HandInfo last_nonpass_action_;
+    int      last_nonpass_player_ = -1;
 
     double greedy_ratio_ = 0.0;
     double random_ratio_ = 0.0;
@@ -258,10 +335,18 @@ private:
     std::string greedy_action() const;
     std::string random_action() const;
 
+    // V11 encoding helpers
+    void encode_obs_static(int player_id, int8_t* out) const;
+    void encode_hist_tokens(int player_id, int8_t* out) const;
+    void encode_hist_token(const RichHistoryEntry& entry, int player_id,
+                           const int* rel_order, int8_t* out) const;
+    void encode_action_feature(const HandInfo& hand, int player_id,
+                               int8_t* out) const;
+
     static void cardset_to_feature(CardSet cs, int8_t* out);
 };
 
-// ======================== Vectorized Engine (batch RL training) ========================
+// ======================== Vectorized Engine ========================
 
 class VectorizedEngine {
 public:
@@ -269,13 +354,13 @@ public:
         int player_id;
         int8_t obs[STATE_DIM];
         int8_t action[ACTION_DIM];
+        Engine::AuxTargets auxiliary;
     };
 
     struct BatchData {
-        std::vector<int8_t> obs_expanded;   // [total_actions * STATE_DIM]
         std::vector<int8_t> action_flat;    // [total_actions * ACTION_DIM]
         std::vector<int8_t> obs_raw;        // [K * STATE_DIM]
-        std::vector<int>    offsets;        // [K + 1]
+        std::vector<int>    offsets;         // [K + 1]
         std::vector<std::vector<std::string>> action_keys;
         int total_actions = 0;
     };
@@ -289,6 +374,7 @@ public:
     void seed(unsigned int base_seed);
 
     int  reset(int idx);
+    void set_rules(int idx, bool require_both, int start_val, int end_val);
     int  step(int idx, const std::string& action_key);
     int  get_player_id(int idx) const;
     bool is_over(int idx) const;
@@ -299,18 +385,14 @@ public:
     void encode_obs(int idx, int player_id, int8_t* out) const;
     void get_action_feature(int idx, const std::string& key, int8_t* out) const;
 
+    std::array<float, NUM_PLAYERS> get_payoffs(int idx) const;
     std::array<float, NUM_PLAYERS> get_training_payoffs(int idx) const;
     const std::vector<float>& get_step_rewards(int idx, int p) const;
-    std::array<std::array<int64_t, 3>, NUM_PLAYERS> get_aux_targets(int idx) const;
+    Engine::AuxTargets get_aux_targets_for_player(int idx, int pid) const;
+    std::array<Engine::AuxTargets, NUM_PLAYERS> get_aux_targets(int idx) const;
 
-    // Advance one env through rule-agent turns until it needs an RL
-    // decision or the game ends.  Returns (is_game_over, rule_steps).
     std::pair<bool, std::vector<RuleStepData>> advance_to_decision(int idx);
-
-    // Pick a random legal action and step (for staggering init only).
     int step_random(int idx);
-
-    // Prepare a single contiguous batch for GPU inference over several envs.
     BatchData prepare_batch(const std::vector<int>& pending) const;
 
 private:
