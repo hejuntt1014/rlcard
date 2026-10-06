@@ -220,6 +220,30 @@ class ContextDMCNet(nn.Module):
         return values, auxiliary
 
 
+class ContextCompiledInference:
+    """Dynamic candidate shapes with actor-local, in-place refreshed parameters."""
+    declaration_flag_index = DECLARE_FLAG_INDEX
+
+    def __init__(self, net):
+        self.net = net
+        options = dict(dynamic=True, fullgraph=True, options={'triton.cudagraphs': False})
+        self.encode_state = torch.compile(net.encode_state, **options)
+        self._play = torch.compile(net._play_q, **options)
+        self._declare = torch.compile(self._declare_eager, **options)
+
+    def _declare_eager(self, context, actions):
+        choice = (actions[:, :52].sum(1) > 26).long()
+        return self.net.declare_head(context).gather(1, choice.unsqueeze(1)).flatten()
+
+    def score_encoded(self, encoded, actions, state_indices=None, phase=None):
+        if phase not in ('play', 'declare'):
+            return self.net.score_encoded(encoded, actions, state_indices, phase=phase)
+        context = encoded[0]
+        if state_indices is not None:
+            context = context.index_select(0, state_indices)
+        return self._play(context, actions) if phase == 'play' else self._declare(context, actions)
+
+
 class ContextInferenceGraphs:
     """Bounded, lazy CUDA-graph cache for an actor-local context network.
 

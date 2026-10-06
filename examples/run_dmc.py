@@ -59,6 +59,11 @@ def train(args):
         actor_half_weights=args.actor_half_weights,
         learner_poll_interval=args.learner_poll_interval,
         actor_poll_interval=args.actor_poll_interval,
+        shared_transport=args.shared_transport,
+        compile_optimizer=args.compile_optimizer,
+        cuda_graph_learner=args.cuda_graph_learner,
+        compile_actor=args.compile_actor,
+        actor_threads=args.actor_threads,
     )
 
     # Train DMC Agents
@@ -158,6 +163,11 @@ if __name__ == '__main__':
     parser.add_argument('--actor_half_weights', action='store_true')
     parser.add_argument('--learner_poll_interval', type=float, default=.002)
     parser.add_argument('--actor_poll_interval', type=float, default=.005)
+    parser.add_argument('--shared_transport', action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument('--compile_optimizer', action='store_true')
+    parser.add_argument('--cuda_graph_learner', action='store_true')
+    parser.add_argument('--compile_actor', action='store_true')
+    parser.add_argument('--actor_threads', type=int, default=1)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     torch.set_num_threads(args.cpu_threads)

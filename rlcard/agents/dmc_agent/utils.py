@@ -18,12 +18,100 @@
 """Bounded CPU shared-memory transport for DMC trajectories."""
 import logging
 from collections import deque
-from queue import Empty
+from queue import Empty, Full
 
 import numpy as np
 import torch
 
 log = logging.getLogger(__name__)
+
+
+class SharedIndexQueue:
+    """Bounded spawn-safe ring for buffer ownership; no pickling or feeder thread.
+
+    Batched reads claim exactly the requested slots, so one actor cannot hoard
+    unused indices in a process-local packet. The lock publishes completed writes.
+    """
+    def __init__(self, context, capacity):
+        if capacity < 1:
+            raise ValueError('Queue capacity must be positive')
+        self.capacity = capacity
+        self.storage = context.RawArray('q', capacity)
+        self.cursors = context.RawArray('q', 3)  # head, tail, size
+        self.lock = context.Lock()
+
+    def put_many(self, values):
+        values = np.asarray(values, dtype=np.int64)
+        n = len(values)
+        if not n:
+            return
+        with self.lock:
+            head, tail, size = self.cursors
+            if n > self.capacity - size:
+                raise Full('Buffer ownership ring overflow')
+            storage = np.frombuffer(self.storage, dtype=np.int64)
+            first = min(n, self.capacity - tail)
+            storage[tail:tail + first] = values[:first]
+            storage[:n - first] = values[first:]
+            self.cursors[1] = (tail + n) % self.capacity
+            self.cursors[2] = size + n
+
+    def get_many(self, count):
+        with self.lock:
+            head, tail, size = self.cursors
+            n = min(count, size)
+            if not n:
+                return []
+            storage = np.frombuffer(self.storage, dtype=np.int64)
+            first = min(n, self.capacity - head)
+            values = storage[head:head + first].tolist()
+            if first < n:
+                values.extend(storage[:n - first].tolist())
+            self.cursors[0] = (head + n) % self.capacity
+            self.cursors[2] = size - n
+            return values
+
+    def put(self, value):
+        self.put_many([value])
+
+    def get_nowait(self):
+        values = self.get_many(1)
+        if not values:
+            raise Empty
+        return values[0]
+
+    def qsize(self):
+        with self.lock:
+            return self.cursors[2]
+
+    def empty(self):
+        return not self.qsize()
+
+    def cancel_join_thread(self):
+        pass
+
+    def close(self):
+        pass
+
+
+def take_indices(queue, count):
+    if hasattr(queue, 'get_many'):
+        return queue.get_many(count)
+    indices = []
+    for _ in range(count):
+        try:
+            indices.append(queue.get_nowait())
+        except Empty:
+            break
+    return indices
+
+
+def publish_indices(queue, indices):
+    if hasattr(queue, 'put_many'):
+        queue.put_many(indices)
+    else:
+        for index in indices:
+            queue.put(index)
 
 
 def create_buffers(T, num_buffers, state_shape, action_shape, device_iterator,
@@ -70,11 +158,9 @@ class BatchReader:
             self.transfer_complete.record(torch.cuda.current_stream(device))
 
     def get(self):
-        while len(self.pending) < self.batch_size:
-            try:
-                self.pending.append(self.full_queue.get_nowait())
-            except Empty:
-                return None
+        self.pending.extend(take_indices(self.full_queue, self.batch_size - len(self.pending)))
+        if len(self.pending) < self.batch_size:
+            return None
         indices = torch.tensor(self.pending, dtype=torch.long)
         if self.pin_memory and self.batch_major:
             if self.staging is None:
@@ -94,8 +180,7 @@ class BatchReader:
             batch = {key: value.index_select(0, indices) for key, value in self.buffers.items()}
         if not self.batch_major:
             batch = {key: value.transpose(0, 1).contiguous() for key, value in batch.items()}
-        for index in self.pending:
-            self.free_queue.put(index)
+        publish_indices(self.free_queue, self.pending)
         self.pending = []
         return batch
 
@@ -148,12 +233,7 @@ class TrajectoryWriter:
                 # Batch a bounded number of complete unrolls while retaining
                 # the existing one-index-per-slot queue ownership protocol.
                 count = min(len(data['target']) // self.T, 16, max(1, 320 // self.T))
-                indices = []
-                for _ in range(count):
-                    try:
-                        indices.append(self.free_queues[p].get_nowait())
-                    except Empty:
-                        break
+                indices = take_indices(self.free_queues[p], count)
                 if not indices:
                     break
                 rows = len(indices) * self.T
@@ -161,8 +241,7 @@ class TrajectoryWriter:
                     output = self.numpy_buffers[p][key]
                     block = np.asarray([values.popleft() for _ in range(rows)], dtype=output.dtype)
                     output[indices] = block.reshape(len(indices), *output.shape[1:])
-                for index in indices:
-                    self.full_queues[p].put(index)
+                publish_indices(self.full_queues[p], indices)
 
     def congested(self):
         return any(len(data['target']) >= self.T * 2 for data in self.pending)
@@ -218,12 +297,7 @@ class ColumnTrajectoryWriter:
         for p, data in enumerate(self.buffers):
             while self.pending_rows[p] >= self.T:
                 count = min(self.pending_rows[p] // self.T, 16)
-                indices = []
-                for _ in range(count):
-                    try:
-                        indices.append(self.free_queues[p].get_nowait())
-                    except Empty:
-                        break
+                indices = take_indices(self.free_queues[p], count)
                 if not indices:
                     break
                 # Consecutive shared slots form writable contiguous views. Copy
@@ -241,8 +315,7 @@ class ColumnTrajectoryWriter:
                     self._copy_rows(p, destinations, rows)
                     start = end
                 self.pending_rows[p] -= len(indices) * self.T
-                for index in indices:
-                    self.full_queues[p].put(index)
+                publish_indices(self.full_queues[p], indices)
 
     def congested(self):
         return any(count >= self.T * 2 for count in self.pending_rows)

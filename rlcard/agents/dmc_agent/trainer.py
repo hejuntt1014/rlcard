@@ -33,7 +33,7 @@ import torch.nn.functional as F
 from .collector import RLCardAdapter, PettingZooAdapter, actor_worker, environment_source
 from .file_writer import FileWriter
 from .model import DMCModel
-from .utils import BatchReader, create_buffers, create_optimizers, log
+from .utils import BatchReader, SharedIndexQueue, create_buffers, create_optimizers, log
 
 
 def compute_loss(logits, targets):
@@ -47,14 +47,19 @@ class FrameScheduler:
         self.learning_rate, self.min_lr = learning_rate, min_lr
         self.total_frames, self.batch_frames = total_frames, batch_frames
         self.frames = self.last_epoch = 0
+        self.rate = learning_rate
 
     def step(self, frames):
         self.frames = frames
         self.last_epoch = frames // self.batch_frames
         progress = min(frames / self.total_frames, 1.)
         rate = self.min_lr + .5 * (self.learning_rate - self.min_lr) * (1 + math.cos(math.pi * progress))
+        self.rate = rate
         for group in self.optimizer.param_groups:
-            group['lr'] = rate
+            if isinstance(group['lr'], torch.Tensor):
+                group['lr'].fill_(rate)
+            else:
+                group['lr'] = rate
 
     def state_dict(self):
         return dict(frames=self.frames, last_epoch=self.last_epoch)
@@ -84,7 +89,15 @@ def auxiliary_loss(logits, labels, classes, task_groups=None):
         return losses.sum() / active.sum().clamp(min=1)
     result = losses.new_zeros(())
     for indices, weight in task_groups:
-        result = result + weight * losses[list(indices)].sum() / active[list(indices)].sum().clamp(min=1)
+        if not indices:
+            continue
+        # Basic scalar indexing stays on the device. A Python index list would
+        # create a CPU index tensor, which is unsafe inside CUDA graph capture.
+        selected_loss = (losses[indices[0]] if len(indices) == 1 else
+                         torch.stack([losses[i] for i in indices]).sum())
+        selected_count = (active[indices[0]].long() if len(indices) == 1 else
+                          torch.stack([active[i] for i in indices]).sum())
+        result = result + weight * selected_loss / selected_count.clamp(min=1)
     return result
 
 
@@ -105,7 +118,7 @@ def learn(position, actor_models, agent, batch, optimizer, training_device,
           max_grad_norm, mean_episode_return_buf, lock=None, sync_weights=True,
           aux_weight=.1, aux_groups=None, precision='fp32', scaler=None,
           transfer_done=None, learner_forward=None, dense_learner=False,
-          learner_objective=None):
+          learner_objective=None, graph_learner=None):
     device = 'cuda:' + str(training_device) if training_device != 'cpu' else 'cpu'
     phase = None
     if dense_learner:
@@ -117,6 +130,11 @@ def learn(position, actor_models, agent, batch, optimizer, training_device,
             phase = 'declare'
         elif not declaration.any().item():
             phase = 'play'
+    returns = batch['episode_return'][batch['done']]
+    if returns.numel():
+        mean_episode_return_buf[position].append(float(returns.mean()))
+    if graph_learner is not None:
+        return graph_learner.step(batch, phase, transfer_done)
     state = batch['state'].to(device, non_blocking=True).flatten(0, 1).float()
     action = batch['action'].to(device, non_blocking=True).flatten(0, 1).float()
     target = batch['target'].to(device, non_blocking=True).flatten(0, 1)
@@ -124,9 +142,6 @@ def learn(position, actor_models, agent, batch, optimizer, training_device,
               if 'aux_target' in batch else None)
     if transfer_done is not None:
         transfer_done(device)
-    returns = batch['episode_return'][batch['done']]
-    if returns.numel():
-        mean_episode_return_buf[position].append(float(returns.mean()))
     with lock if lock is not None else contextlib.nullcontext():
         amp = (torch.autocast('cuda', dtype=torch.bfloat16 if precision == 'bf16' else torch.float16)
                if device != 'cpu' and precision != 'fp32' else contextlib.nullcontext())
@@ -186,7 +201,9 @@ class DMCTrainer:
                  pin_memory=True, dense_learner=True, compile_learner=False,
                  compile_mode='default', actor_cuda_graphs=False,
                  actor_half_weights=False, learner_poll_interval=.002,
-                 actor_poll_interval=.005):
+                 actor_poll_interval=.005, shared_transport=False, compile_optimizer=False,
+                 cuda_graph_learner=False, compile_actor=False,
+                 actor_threads=1):
         positive = dict(batch_size=batch_size, unroll_length=unroll_length,
                         num_buffers=num_buffers, num_actors=num_actors,
                         num_actor_devices=num_actor_devices, envs_per_actor=envs_per_actor,
@@ -210,7 +227,7 @@ class DMCTrainer:
             raise ValueError('Actor and learner polling intervals must be finite and positive')
         self.learner_poll_interval = learner_poll_interval
         self.actor_poll_interval = actor_poll_interval
-        if compile_learner and not hasattr(torch, 'compile'):
+        if (compile_learner or compile_actor) and not hasattr(torch, 'compile'):
             raise ValueError('compile_learner requires torch.compile support')
         if compile_mode not in ('default', 'reduce-overhead', 'max-autotune', 'max-autotune-no-cudagraphs'):
             raise ValueError('Unsupported compile_mode')
@@ -235,6 +252,15 @@ class DMCTrainer:
         if precision != 'fp32' and not cuda:
             raise ValueError('Mixed precision requires CUDA')
         self.env = env
+        if compile_optimizer and (not cuda or training_device == 'cpu' or not hasattr(torch, 'compile')):
+            raise ValueError('compile_optimizer requires a CUDA learner and torch.compile')
+        self.shared_transport = bool(shared_transport)
+        self.compile_optimizer = bool(compile_optimizer)
+        if cuda_graph_learner and (not cuda or training_device == 'cpu' or precision == 'fp16'):
+            raise ValueError('cuda_graph_learner requires a CUDA learner with fp32 or bf16 precision')
+        self.cuda_graph_learner = bool(cuda_graph_learner)
+        self.compile_actor = bool(compile_actor)
+        self.actor_threads = actor_threads
         self.env_source = env_factory or environment_source(env)
         self.is_pettingzoo_env = is_pettingzoo_env
         is_v12 = not is_pettingzoo_env and getattr(env, 'name', '') == 'a3dizhu-v12'
@@ -267,6 +293,8 @@ class DMCTrainer:
             raise ValueError('Native A3 backend unavailable: build the current C++ extension')
         self.backend = ('cpp' if native and adapter_class is None else 'python') if backend == 'auto' else backend
         self.architecture = architecture or ('context' if is_v12 else 'resnet' if is_a3 else 'mlp')
+        if cuda_graph_learner and self.architecture == 'context' and not dense_learner:
+            raise ValueError('Context CUDA learner replay requires dense_learner')
         self.aux_classes = tuple(getattr(env, 'aux_classes', (3, 3, 3))) if (is_a3 if auxiliary is None else auxiliary) else ()
         self.aux_groups = (((0, 1, 2), .1), ((3,), .05), ((4,), .05)) if is_v12 and self.aux_classes else None
         self.history_encoder, self.precision = history_encoder, precision
@@ -301,6 +329,13 @@ class DMCTrainer:
             self.training_device = 'cpu'
         if self.actor_cuda_graphs and (not cuda or actor_on_cpu or self.architecture != 'context'):
             raise ValueError('actor_cuda_graphs requires CUDA actors and the context architecture')
+        if self.compile_actor and (not cuda or actor_on_cpu or self.architecture != 'context' or self.actor_cuda_graphs):
+            raise ValueError('compile_actor requires CUDA context actors without actor_cuda_graphs')
+        if type(actor_threads) is not int or actor_threads < 1:
+            raise ValueError('actor_threads must be a positive integer')
+        if actor_threads > 1 and (not cuda or actor_on_cpu or not is_v12 or self.backend != 'cpp'
+                                  or self.actor_cuda_graphs):
+            raise ValueError('Threaded actors require native CUDA A3 without actor_cuda_graphs')
         if self.actor_half_weights and (not cuda or actor_on_cpu or precision == 'fp32'):
             raise ValueError('actor_half_weights requires CUDA actors and bf16/fp16 precision')
         self.T, self.B = unroll_length, batch_size
@@ -357,11 +392,14 @@ class DMCTrainer:
                 continue
             forward = agent.net.forward_with_aux_dense if use_dense else agent.forward_with_aux
             learner_forwards[id(agent)] = forward
-            if self.compile_learner:
+            if self.compile_learner or self.cuda_graph_learner:
                 objective = _make_training_objective(forward, agent.net.aux_classes,
                                                      self.aux_groups, use_dense)
-                learner_objectives[id(agent)] = torch.compile(objective, mode=self.compile_mode,
-                                                              fullgraph=True, dynamic=False)
+                if self.compile_learner:
+                    options = ({'options': {'triton.cudagraphs': False}} if self.cuda_graph_learner
+                               else {'mode': self.compile_mode})
+                    objective = torch.compile(objective, fullgraph=True, dynamic=False, **options)
+                learner_objectives[id(agent)] = objective
         optimizers = create_optimizers(self.num_players, self.learning_rate, self.momentum,
                                       self.epsilon, self.alpha, learner)
         unique_opts = list({id(o): o for o in optimizers}.values())
@@ -392,6 +430,29 @@ class DMCTrainer:
             if scaler is not None and state.get('scaler_state_dict') is not None:
                 scaler.load_state_dict(state['scaler_state_dict'])
         ctx = mp.get_context('spawn')
+        # Normalize saved optimizer runtime settings when switching compilation
+        # on/off. State tensors remain compatible with ordinary RMSprop.
+        for optimizer in unique_opts:
+            capturable = self.compile_optimizer or self.cuda_graph_learner
+            for group in optimizer.param_groups:
+                rate = float(group['lr'])
+                group['capturable'] = capturable
+                group['lr'] = (torch.tensor(rate, device='cuda:' + self.training_device)
+                               if capturable else rate)
+            for state in optimizer.state.values():
+                if 'step' in state:
+                    state['step'] = state['step'].to('cuda:' + self.training_device
+                                                   if capturable else 'cpu')
+            if self.compile_optimizer:
+                optimizer.step = torch.compile(optimizer.step, fullgraph=False,
+                                               options={'triton.cudagraphs': False})
+        graph_learners = {}
+        if self.cuda_graph_learner:
+            from .graph_learner import CUDALearner
+            for p, agent in enumerate(learner.get_agents()):
+                if id(agent) not in graph_learners:
+                    graph_learners[id(agent)] = CUDALearner(agent, optimizers[p],
+                        learner_objectives[id(agent)], self.precision, self.max_grad_norm)
         stop = ctx.Event()
         exploration = ctx.Value('d', self._get_epsilon(self.frames))
         errors = ctx.Queue()
@@ -405,8 +466,10 @@ class DMCTrainer:
             models[device].eval()
             locks[device] = ctx.Lock()
             versions[device] = ctx.Value('q', 0)
-            free[device] = [ctx.Queue(maxsize=self.num_buffers) for _ in range(self.num_players)]
-            full[device] = [ctx.Queue(maxsize=self.num_buffers) for _ in range(self.num_players)]
+            make_queue = (lambda: SharedIndexQueue(ctx, self.num_buffers)) if self.shared_transport else (
+                lambda: ctx.Queue(maxsize=self.num_buffers))
+            free[device] = [make_queue() for _ in range(self.num_players)]
+            full[device] = [make_queue() for _ in range(self.num_players)]
             for p in range(self.num_players):
                 if not self.share_weights or p == 0:
                     models[device].get_agent(p).load_state_dict(learner.get_agent(p).state_dict())
@@ -423,6 +486,10 @@ class DMCTrainer:
             precision=self.precision, pin_memory=self.pin_memory and self.training_device != 'cpu',
             dense_learner=use_dense, compile_learner=self.compile_learner,
             compile_mode=self.compile_mode,
+            compile_optimizer=self.compile_optimizer, shared_transport=self.shared_transport,
+            cuda_graph_learner=self.cuda_graph_learner,
+            compile_actor=self.compile_actor,
+            actor_threads=self.actor_threads,
             actor_cuda_graphs=self.actor_cuda_graphs, actor_half_weights=self.actor_half_weights,
             learner_poll_interval=self.learner_poll_interval, actor_poll_interval=self.actor_poll_interval,
             cpu_threads=torch.get_num_threads(), env_config=getattr(self.env, '_creation_config', {})),
@@ -483,7 +550,8 @@ class DMCTrainer:
                                   errors, counter, self.T, self.envs_per_actor, self.backend,
                                   self.adapter_class, self.max_inference_actions, self.max_episode_steps,
                                   device, versions[device], self.precision,
-                                  self.actor_cuda_graphs, self.actor_half_weights, self.actor_poll_interval))
+                                  self.actor_cuda_graphs, self.actor_half_weights, self.actor_poll_interval,
+                                  self.compile_actor, self.actor_threads))
                         actor.start()
                         self.actor_processes.append(actor)
             while self.frames < self.total_frames:
@@ -502,7 +570,7 @@ class DMCTrainer:
                     batch = reader.get()
                     if batch is None:
                         continue
-                    if self.compile_learner and hasattr(getattr(torch, 'compiler', None), 'cudagraph_mark_step_begin'):
+                    if self.compile_learner and not self.cuda_graph_learner and hasattr(getattr(torch, 'compiler', None), 'cudagraph_mark_step_begin'):
                         torch.compiler.cudagraph_mark_step_begin()
                     loss = learn(p, {}, learner.get_agent(p), batch, optimizers[p],
                                  self.training_device, self.max_grad_norm,
@@ -511,7 +579,8 @@ class DMCTrainer:
                                  transfer_done=reader.mark_transferred,
                                  learner_forward=learner_forwards[id(learner.get_agent(p))],
                                  dense_learner=use_dense,
-                                 learner_objective=learner_objectives.get(id(learner.get_agent(p))))
+                                 learner_objective=learner_objectives.get(id(learner.get_agent(p))),
+                                 graph_learner=graph_learners.get(id(learner.get_agent(p))))
                     loss_totals[p].append(loss)
                     self.frames += self.T * self.B
                     updates += 1
@@ -524,7 +593,7 @@ class DMCTrainer:
                     last_batch = time.monotonic()
                     if updates % self.stats_interval == 0:
                         self._record_stats(loss_totals, counters, updates, exploration.value,
-                                           optimizers[0].param_groups[0]['lr'], start_time, start_frames)
+                                           schedulers[0].rate, start_time, start_frames)
                 if not trained:
                     stop.wait(self.learner_poll_interval)
                 now = time.monotonic()
@@ -550,7 +619,7 @@ class DMCTrainer:
                     actor.terminate()
                     actor.join(timeout=5)
             self._record_stats(loss_totals, counters, updates, exploration.value,
-                               optimizers[0].param_groups[0]['lr'], start_time, start_frames)
+                               schedulers[0].rate, start_time, start_frames)
             checkpoint()
             for queues in (free, full):
                 for group in queues.values():

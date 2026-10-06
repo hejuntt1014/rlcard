@@ -128,14 +128,15 @@ def choose_action_indices(agent, observations, actions, offsets, epsilon, max_ac
     if len(offsets) != len(observations) + 1 or offsets[0] != 0 or offsets[-1] != len(actions):
         raise ValueError('Offsets do not match observations and actions')
     choices = np.empty(len(counts), dtype=np.int64)
+    rng = getattr(agent, 'rng', np.random)
     pending = []
     for i, count in enumerate(counts):
         if count <= 0:
             raise ValueError('Each decision must have a legal action')
         if count == 1:
             choices[i] = 0
-        elif np.random.random() < epsilon:
-            choices[i] = np.random.randint(count)
+        elif rng.random() < epsilon:
+            choices[i] = rng.randint(count)
         else:
             pending.append(i)
     if pending:
@@ -287,7 +288,8 @@ def actor_worker(actor_id, seed, env, model, model_lock, buffers,
                  free_queues, full_queues, stop, epsilon, errors, counters,
                  T, count, backend, adapter_class, max_actions, max_episode_steps,
                  inference_device='cpu', policy_version=None, precision='fp32',
-                 actor_cuda_graphs=False, actor_half_weights=False, actor_poll_interval=.005):
+                 actor_cuda_graphs=False, actor_half_weights=False, actor_poll_interval=.005,
+                 compile_actor=False, actor_threads=1):
     try:
         torch.set_num_threads(1)
         random.seed(seed)
@@ -312,6 +314,15 @@ def actor_worker(actor_id, seed, env, model, model_lock, buffers,
                 if actor_cuda_graphs:
                     from .context_model import ContextInferenceGraphs
                     agent.inference_runner = ContextInferenceGraphs(agent.net, dtype=agent.inference_dtype)
+                if compile_actor:
+                    from .context_model import ContextCompiledInference
+                    agent.inference_runner = ContextCompiledInference(agent.net)
+        if actor_threads > 1:
+            from .threaded_actor import run_threaded_actor
+            run_threaded_actor(seed, env, model, shared_model, model_lock, local_version,
+                policy_version, buffers, free_queues, full_queues, stop, epsilon, counters,
+                T, count, max_actions, max_episode_steps, actor_poll_interval, actor_threads)
+            return
         if backend == 'cpp':
             from rlcard.envs.a3dizhu.dmc import NativePool
             pool = NativePool(env() if callable(env) else env, count, seed, max_episode_steps)

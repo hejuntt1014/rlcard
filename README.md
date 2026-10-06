@@ -51,6 +51,8 @@ Train RLCard environments with per-role batched inference, bounded shared-memory
 
 The [RTX 5060 throughput study](docs/benchmarks/training-optimization.md) includes reproducible actor, compiler, native rollout and MPS comparisons with fixed training-update size.
 
+The [complete-update replay study](docs/benchmarks/training-optimization-round2.md) compares compiled optimizers, shared index rings and threaded actors on the same update size.
+
 ## Contributors
 The following games are mainly developed and maintained by community contributors. Thank you!
 *   Gin Rummy: [@billh0420](https://github.com/billh0420)

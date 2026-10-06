@@ -145,6 +145,10 @@ range regardless of whether a card combination was previously cached.
 
 ## Evaluate playing quality
 
+See the [second RTX 5060 study](benchmarks/training-optimization-round2.md) for
+optional complete-update CUDA replay and threaded native actors. When using
+`actor_threads > 1`, `envs_per_actor` is the environment count per thread.
+
 ```bash
 python -m examples.evaluate_dmc experiments/dmc_result/a3_context/model.tar --env a3dizhu-v12 --seeds 100 --output experiments/evaluation/context.json
 ```

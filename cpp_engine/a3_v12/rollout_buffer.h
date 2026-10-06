@@ -88,11 +88,17 @@ public:
                 throw py::value_error("Invalid player or candidate choice");
             check_capacity(idx, 1);
         }
-        for (size_t row = 0; row < rows; ++row) {
-            const size_t selected = size_t(offsets[row]) + size_t(choices[row]);
-            episodes_[indices[row]][players[row]].append(obs.data() + row * STATE_DIM,
-                actions.data() + selected * ACTION_DIM, auxiliary.data() + row * 5);
-            ++counts_[indices[row]];
+        const auto* observations = obs.data();
+        const auto* candidates = actions.data();
+        const auto* labels = auxiliary.data();
+        {
+            py::gil_scoped_release release;
+            for (size_t row = 0; row < rows; ++row) {
+                const size_t selected = size_t(offsets[row]) + size_t(choices[row]);
+                episodes_[indices[row]][players[row]].append(observations + row * STATE_DIM,
+                    candidates + selected * ACTION_DIM, labels + row * 5);
+                ++counts_[indices[row]];
+            }
         }
     }
 

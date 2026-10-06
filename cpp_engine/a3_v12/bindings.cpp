@@ -15,7 +15,11 @@ static py::tuple prepare_numpy_batch(const VectorizedEngine& v,
     for (const int idx : pending)
         if (idx < 0 || idx >= v.num_envs())
             throw py::index_error("Environment index out of range");
-    auto* batch = new VectorizedEngine::BatchData(v.prepare_batch(pending, indexed));
+    VectorizedEngine::BatchData* batch;
+    {
+        py::gil_scoped_release release;
+        batch = new VectorizedEngine::BatchData(v.prepare_batch(pending, indexed));
+    }
     py::capsule owner(batch, [](void* ptr) {
         delete static_cast<VectorizedEngine::BatchData*>(ptr);
     });
@@ -255,7 +259,7 @@ PYBIND11_MODULE(a3dizhu_v12_cpp, m) {
 
         .def("step_random", &VectorizedEngine::step_random, py::arg("idx"))
         .def("step_choices", &VectorizedEngine::step_choices,
-             py::arg("indices"), py::arg("choices"))
+             py::arg("indices"), py::arg("choices"), py::call_guard<py::gil_scoped_release>())
 
         .def("step_batch", [](VectorizedEngine& v, const std::vector<int>& indices,
                               const std::vector<std::string>& keys) {

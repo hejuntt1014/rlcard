@@ -7,6 +7,13 @@ learner consumes fixed-length trajectory blocks from CPU shared memory.
 The [A3 context policy](a3-context.md) provides structured history, reusable state
 encoding, independent declaration scoring, and optional mixed precision.
 
+Optional shared-index transport, optimizer compilation, complete-update CUDA
+replay and threaded actors are described in the
+[second RTX 5060 study](benchmarks/training-optimization-round2.md). These options
+default to off (`actor_threads=1`). Complete learner replay supports FP32/BF16;
+threaded actors require the native A3 context backend with CUDA. Compiler paths
+require a compatible PyTorch/Triton toolchain. All retain portable FP32 checkpoints.
+
 ## Install
 
 Python 3.10 or later is required. Check out the training branch:
