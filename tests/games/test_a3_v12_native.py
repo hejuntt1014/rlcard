@@ -153,33 +153,39 @@ class TestA3RichNative(unittest.TestCase):
         np.testing.assert_allclose(engine.get_step_rewards(0), [0., 0.], atol=1e-7)
 
     def test_greedy_never_passes_when_last_card_must_beat_teammate(self):
-        modules = [(self.native, 16, 90, 'spade_7')]
+        modules = [self.native]
         if importlib.util.find_spec('a3dizhu_cpp') is not None:
             import a3dizhu_cpp
-            modules.append((a3dizhu_cpp, 13, 50, 'diamond_10'))
-        for module, seed, regression_step, forced_card in modules:
-            with self.subTest(module=module.__name__):
-                engine = module.CppEngine()
-                engine.seed(seed)
-                engine.set_greedy_ratio(1.)
-                engine.reset()
-                rng = random.Random(seed)
-                reached_regression = False
-                for step in range(300):
-                    if engine.is_over():
-                        break
+            modules.append(a3dizhu_cpp)
+        for module in modules:
+            for remaining in (['club_4'], ['club_4', 'club_5']):
+                with self.subTest(module=module.__name__, remaining=remaining):
+                    engine = module.CppEngine()
+                    engine.reset_with_hands([
+                        ['spade_4', 'spade_8'],
+                        ['diamond_4', 'diamond_5', 'diamond_9'],
+                        remaining,
+                        ['heart_4', 'heart_8'],
+                    ], 1)
+                    # Declaring makes players 1 and 2 publicly known teammates.
+                    # Player 1 leads the required diamond 4; player 2 can beat it.
+                    for player, key in ((0, 'declare'), (1, 'diamond_4')):
+                        self.assertEqual(engine.get_player_id(), player)
+                        self.assertIn(key, engine.get_legal_actions())
+                        engine.step(key)
+                    self.assertEqual(engine.get_player_id(), 2)
+                    self.assertFalse(engine.is_over())
                     legal = engine.get_legal_actions()
-                    greedy = engine.get_rule_agent_action()
+                    greedy = engine.get_greedy_action()
                     self.assertIn(greedy, legal)
-                    if step == regression_step:
-                        self.assertEqual(list(legal), [forced_card])
-                        self.assertEqual(greedy, forced_card)
-                        reached_regression = True
-                    # Keep the same legal random path independent of greedy's
-                    # output so that the precise old failure is exercised.
-                    engine.step(rng.choice(list(legal)))
-                self.assertTrue(reached_regression)
-                self.assertTrue(engine.is_over())
+                    if len(remaining) == 1:
+                        self.assertEqual(set(legal), {'club_4'})
+                        self.assertEqual(greedy, 'club_4')
+                    else:
+                        self.assertIn('pass', legal)
+                        self.assertEqual(greedy, 'pass')
+                    engine.step(greedy)
+                    self.assertEqual(engine.is_over(), len(remaining) == 1)
 
     def test_uncached_flush_keys_obey_room_straight_limits(self):
         cases = [(('3', '4', '5', '6', '7'), 2, 12, False),

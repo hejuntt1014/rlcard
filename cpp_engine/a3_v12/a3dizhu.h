@@ -294,6 +294,7 @@ public:
     void get_action_feature(const std::string& key, int8_t* out) const;
 
     std::string get_rule_agent_action() const;
+    std::string get_greedy_action() const { return greedy_action(); }
 
     std::array<float,NUM_PLAYERS> get_payoffs()          const;
     std::array<float,NUM_PLAYERS> get_training_payoffs()  const;

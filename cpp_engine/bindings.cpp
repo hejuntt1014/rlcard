@@ -30,6 +30,7 @@ PYBIND11_MODULE(a3dizhu_cpp, m) {
         .def("is_over", &Engine::is_over)
         .def("is_declaration_phase", &Engine::is_declaration_phase)
         .def("get_mode", &Engine::get_mode)
+        .def("get_greedy_action", &Engine::get_greedy_action)
         .def("is_rule_agent_seat", &Engine::is_rule_agent_seat, py::arg("pid"))
 
         .def("encode_obs", [](const Engine& e, int player_id) {
