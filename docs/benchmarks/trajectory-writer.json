@@ -1,0 +1,79 @@
+{
+  "date": "2026-10-06",
+  "scope": "CPU trajectory packing microbenchmark, not end-to-end training",
+  "hardware": {
+    "cpu": "Intel(R) Core(TM) Ultra 7 258V",
+    "os": "Windows",
+    "python": "3.12.10",
+    "torch": "2.10.0+cpu",
+    "numpy": "2.4.3",
+    "torch_threads": 1
+  },
+  "fixture": {
+    "environment": "a3dizhu-v12",
+    "reward_mode": "game",
+    "native_pool_size": 32,
+    "native_seed": 42,
+    "numpy_seed": 42,
+    "exploration_epsilon": 1.0,
+    "completed_episodes": 128,
+    "input_decision_samples": 10713,
+    "published_decision_samples": null,
+    "observation_dimension": 2668,
+    "action_dimension": 111,
+    "auxiliary_labels": 5,
+    "description": "Collect the first 128 completed episodes from NativePool.round using a shared context DMCModel with hidden width 16. Epsilon 1 bypasses value inference. Reuse these exact episode records, payoffs and auxiliary labels for both writers."
+  },
+  "implementations": {
+    "baseline": "Original flush: for each role and complete T-step unroll, take one free slot, create np.asarray for every field, torch.as_tensor(block), then shared_tensor[index].copy_ and publish the index.",
+    "optimized": "Cache NumPy views of CPU shared tensors. Take up to min(16, max(1, 320 // T)) available slots per group. Build each field with its final storage dtype, scatter the grouped unrolls into the NumPy view, then publish each completed slot separately."
+  },
+  "method": {
+    "repetitions_per_case": 6,
+    "reported_statistic": "median wall-clock milliseconds",
+    "raw_repetition_samples_retained": false,
+    "timer": "time.perf_counter",
+    "queues": "queue.Queue in one process; multiprocessing serialization and process scheduling excluded",
+    "allocation": "Shared buffers, queues and writer construction excluded from timer",
+    "correctness": "For the fully accumulated episode fixture, compare every published state, action, target, done, episode_return and aux_target tensor to the baseline with rtol=0 and atol=0; all matched.",
+    "pending_tail": "Incomplete unrolls remain pending in both writers. Input sample count includes these tails; published sample count was not recorded."
+  },
+  "results": [
+    {
+      "mode": "accumulated",
+      "description": "Add all 128 episodes then flush. Each role has enough free slots for its entire complete-unroll output.",
+      "unroll_length": 20,
+      "baseline_median_ms": 32.01839997200295,
+      "optimized_median_ms": 17.88825000403449
+    },
+    {
+      "mode": "accumulated",
+      "description": "Add all 128 episodes then flush. Each role has enough free slots for its entire complete-unroll output.",
+      "unroll_length": 80,
+      "baseline_median_ms": 20.67045000148937,
+      "optimized_median_ms": 17.4081499571912
+    },
+    {
+      "mode": "streaming",
+      "description": "Use eight slots per role. After adding each episode, flush and immediately consume all full indices and return them to the free queues; this consumer queue work is included in the timer.",
+      "unroll_length": 20,
+      "baseline_median_ms": 28.109350008890033,
+      "optimized_median_ms": 21.49940002709627
+    },
+    {
+      "mode": "streaming",
+      "description": "Use eight slots per role. After adding each episode, flush and immediately consume all full indices and return them to the free queues; this consumer queue work is included in the timer.",
+      "unroll_length": 80,
+      "baseline_median_ms": 18.050649960059673,
+      "optimized_median_ms": 15.411000000312924
+    }
+  ],
+  "limitations": [
+    "These ratios measure only trajectory packing, not total training throughput.",
+    "This Windows laptop CPU differs from the PVE training server CPU.",
+    "Results use one fixed rollout seed and exploration-only complete episodes.",
+    "Queue IPC, actor inference, GPU transfers, learner updates and weight publication are excluded.",
+    "Only the six-run medians were retained; individual repetition durations are unavailable.",
+    "Changing unroll length changes transport granularity and incomplete-tail handling; compare each optimized writer against its same-T baseline."
+  ]
+}

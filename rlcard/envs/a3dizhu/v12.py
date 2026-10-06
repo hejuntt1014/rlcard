@@ -51,6 +51,8 @@ class A3ContextEnv:
         self._engine = native.CppEngine()
         self._engine.set_greedy_ratio(self.greedy_ratio)
         self._engine.set_random_ratio(self.random_ratio)
+        if hasattr(self._engine, 'set_reward_shaping'):
+            self._engine.set_reward_shaping(self.reward_mode == 'shaped')
         self.num_players, self.num_actions = 4, 1
         self.state_shape = [[STATE_DIM] for _ in range(4)]
         self.action_shape = [[ACTION_DIM] for _ in range(4)]

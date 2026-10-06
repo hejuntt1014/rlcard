@@ -2,9 +2,47 @@
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 #include "a3dizhu.h"
+#include "rollout_buffer.h"
 
 namespace py = pybind11;
 using namespace a3dizhu_v12;
+
+// Arrays own a shared BatchData capsule. No copy into a second NumPy allocation,
+// and outstanding trajectories remain valid after later engine calls.
+static py::tuple prepare_numpy_batch(const VectorizedEngine& v,
+                                    const std::vector<int>& pending, bool metadata,
+                                    bool indexed = false) {
+    for (const int idx : pending)
+        if (idx < 0 || idx >= v.num_envs())
+            throw py::index_error("Environment index out of range");
+    auto* batch = new VectorizedEngine::BatchData(v.prepare_batch(pending, indexed));
+    py::capsule owner(batch, [](void* ptr) {
+        delete static_cast<VectorizedEngine::BatchData*>(ptr);
+    });
+    const py::ssize_t count = pending.size(), total = batch->total_actions;
+    py::array_t<int8_t> observations({count, py::ssize_t(STATE_DIM)},
+        {py::ssize_t(STATE_DIM), py::ssize_t(1)}, batch->obs_raw.data(), owner);
+    py::array_t<int8_t> actions({total, py::ssize_t(ACTION_DIM)},
+        {py::ssize_t(ACTION_DIM), py::ssize_t(1)}, batch->action_flat.data(), owner);
+    if (!metadata)
+        return py::make_tuple(observations, actions, batch->offsets, batch->action_keys);
+    std::vector<int> players;
+    players.reserve(count);
+    py::array_t<int64_t> auxiliary({count, py::ssize_t(5)});
+    for (py::ssize_t row = 0; row < count; ++row) {
+        const int pid = v.get_player_id(pending[row]);
+        players.push_back(pid);
+        const auto labels = v.get_aux_targets_for_player(pending[row], pid);
+        auto* out = auxiliary.mutable_data() + row * 5;
+        for (int j = 0; j < 3; ++j) out[j] = labels.relation[j];
+        out[3] = labels.s3_owner;
+        out[4] = labels.sa_owner;
+    }
+    if (indexed)
+        return py::make_tuple(observations, actions, batch->offsets, players, auxiliary);
+    return py::make_tuple(observations, actions, batch->offsets, batch->action_keys,
+                          players, auxiliary);
+}
 
 PYBIND11_MODULE(a3dizhu_v12_cpp, m) {
     m.doc() = "A3 Dizhu engine with compact batches and 24-step history features";
@@ -15,6 +53,16 @@ PYBIND11_MODULE(a3dizhu_v12_cpp, m) {
     m.attr("HISTORY_LEN") = HISTORY_LEN;
     m.attr("HIST_TOKEN_DIM") = HIST_TOKEN_DIM;
     m.attr("AUX_DIM") = AUX_DIM;
+
+    py::class_<RolloutBuffer>(m, "RolloutBuffer", py::module_local())
+        .def(py::init<int, int>(), py::arg("num_envs"), py::arg("max_episode_steps") = 10000)
+        .def("size", &RolloutBuffer::size, py::arg("idx"))
+        .def("clear", &RolloutBuffer::clear, py::arg("idx"))
+        .def("record_choices", &RolloutBuffer::record_choices, py::arg("indices"), py::arg("choices"),
+             py::arg("obs"), py::arg("actions"), py::arg("offsets"), py::arg("players"), py::arg("auxiliary"))
+        .def("record_block", &RolloutBuffer::record_block, py::arg("idx"), py::arg("obs"),
+             py::arg("players"), py::arg("actions"), py::arg("auxiliary"))
+        .def("finish", &RolloutBuffer::finish, py::arg("idx"), py::arg("payoffs"), py::arg("rewards") = py::none());
 
     m.def("compute_afterstate", [](const std::vector<std::string>& cards,
                                   int start_val, int end_val) {
@@ -52,6 +100,7 @@ PYBIND11_MODULE(a3dizhu_v12_cpp, m) {
 
         .def("set_greedy_ratio", &Engine::set_greedy_ratio)
         .def("set_random_ratio", &Engine::set_random_ratio)
+        .def("set_reward_shaping", &Engine::set_reward_shaping)
         .def("seed", &Engine::seed)
 
         .def("reset", &Engine::reset,
@@ -140,6 +189,7 @@ PYBIND11_MODULE(a3dizhu_v12_cpp, m) {
         .def("num_envs", &VectorizedEngine::num_envs)
         .def("set_greedy_ratio", &VectorizedEngine::set_greedy_ratio)
         .def("set_random_ratio", &VectorizedEngine::set_random_ratio)
+        .def("set_reward_shaping", &VectorizedEngine::set_reward_shaping)
         .def("seed", &VectorizedEngine::seed, py::arg("base_seed"))
 
         .def("reset", &VectorizedEngine::reset, py::arg("idx"))
@@ -204,6 +254,54 @@ PYBIND11_MODULE(a3dizhu_v12_cpp, m) {
         }, py::arg("idx"), py::arg("player_id"))
 
         .def("step_random", &VectorizedEngine::step_random, py::arg("idx"))
+        .def("step_choices", &VectorizedEngine::step_choices,
+             py::arg("indices"), py::arg("choices"))
+
+        .def("step_batch", [](VectorizedEngine& v, const std::vector<int>& indices,
+                              const std::vector<std::string>& keys) {
+            if (indices.size() != keys.size())
+                throw py::value_error("One action key is required per environment");
+            for (const int idx : indices)
+                if (idx < 0 || idx >= v.num_envs())
+                    throw py::index_error("Environment index out of range");
+            for (size_t row = 0; row < indices.size(); ++row)
+                v.step(indices[row], keys[row]);
+        }, py::arg("indices"), py::arg("keys"))
+
+        .def("advance_batch", [](VectorizedEngine& v) {
+            std::vector<int> done, pending, players;
+            pending.reserve(v.num_envs());
+            players.reserve(v.num_envs());
+            py::list records;
+            for (int idx = 0; idx < v.num_envs(); ++idx) {
+                auto result = v.advance_to_decision(idx);
+                const auto& steps = result.second;
+                if (!steps.empty()) {
+                    const int count = (int)steps.size();
+                    py::array_t<int8_t> obs({count, STATE_DIM});
+                    py::array_t<int8_t> actions({count, ACTION_DIM});
+                    py::array_t<int64_t> auxiliary({count, 5});
+                    std::vector<int> pids;
+                    pids.reserve(count);
+                    for (int row = 0; row < count; ++row) {
+                        std::memcpy(obs.mutable_data() + row * STATE_DIM, steps[row].obs, STATE_DIM);
+                        std::memcpy(actions.mutable_data() + row * ACTION_DIM, steps[row].action, ACTION_DIM);
+                        auto* out = auxiliary.mutable_data() + row * 5;
+                        for (int j = 0; j < 3; ++j) out[j] = steps[row].auxiliary.relation[j];
+                        out[3] = steps[row].auxiliary.s3_owner;
+                        out[4] = steps[row].auxiliary.sa_owner;
+                        pids.push_back(steps[row].player_id);
+                    }
+                    records.append(py::make_tuple(idx, obs, pids, actions, auxiliary));
+                }
+                if (result.first) done.push_back(idx);
+                else {
+                    pending.push_back(idx);
+                    players.push_back(v.get_player_id(idx));
+                }
+            }
+            return py::make_tuple(done, pending, players, records);
+        })
 
         .def("advance_to_decision", [](VectorizedEngine& v, int idx) {
             auto [done, steps] = v.advance_to_decision(idx);
@@ -239,27 +337,15 @@ PYBIND11_MODULE(a3dizhu_v12_cpp, m) {
 
         .def("prepare_batch", [](const VectorizedEngine& v,
                                  const std::vector<int>& pending) {
-            auto bd = v.prepare_batch(pending);
-            int T = bd.total_actions, K = (int)pending.size();
-
-            py::array_t<int8_t> act_flat({T, (int)ACTION_DIM});
-            if (T > 0) std::memcpy(act_flat.mutable_data(),
-                                   bd.action_flat.data(), bd.action_flat.size());
-
-            py::array_t<int8_t> obs_raw({K, (int)STATE_DIM});
-            if (K > 0) std::memcpy(obs_raw.mutable_data(),
-                                   bd.obs_raw.data(), bd.obs_raw.size());
-
-            py::list offsets;
-            for (int o : bd.offsets) offsets.append(o);
-
-            py::list all_keys;
-            for (auto& keys : bd.action_keys) {
-                py::list ek;
-                for (auto& k : keys) ek.append(k);
-                all_keys.append(ek);
-            }
-            return py::make_tuple(obs_raw, act_flat, offsets, all_keys);
+            return prepare_numpy_batch(v, pending, false);
+        }, py::arg("pending_indices"))
+        .def("prepare_batch_with_metadata", [](const VectorizedEngine& v,
+                                               const std::vector<int>& pending) {
+            return prepare_numpy_batch(v, pending, true);
+        }, py::arg("pending_indices"))
+        .def("prepare_indexed_batch", [](const VectorizedEngine& v,
+                                         const std::vector<int>& pending) {
+            return prepare_numpy_batch(v, pending, true, true);
         }, py::arg("pending_indices"))
     ;
 }

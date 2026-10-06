@@ -51,6 +51,14 @@ def train(args):
         initial_epsilon=args.initial_epsilon,
         final_epsilon=args.final_epsilon,
         learning_rate=args.learning_rate,
+        pin_memory=args.pin_memory,
+        dense_learner=args.dense_learner,
+        compile_learner=args.compile_learner,
+        compile_mode=args.compile_mode,
+        actor_cuda_graphs=args.actor_cuda_graphs,
+        actor_half_weights=args.actor_half_weights,
+        learner_poll_interval=args.learner_poll_interval,
+        actor_poll_interval=args.actor_poll_interval,
     )
 
     # Train DMC Agents
@@ -142,6 +150,14 @@ if __name__ == '__main__':
     parser.add_argument('--weight_sync_interval', type=int, default=50)
     parser.add_argument('--cpu_threads', type=int, default=1)
     parser.add_argument('--actor_on_cpu', action='store_true')
+    parser.add_argument('--pin_memory', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--dense_learner', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--compile_learner', action='store_true')
+    parser.add_argument('--compile_mode', choices=['default', 'reduce-overhead', 'max-autotune'], default='default')
+    parser.add_argument('--actor_cuda_graphs', action='store_true')
+    parser.add_argument('--actor_half_weights', action='store_true')
+    parser.add_argument('--learner_poll_interval', type=float, default=.002)
+    parser.add_argument('--actor_poll_interval', type=float, default=.005)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     torch.set_num_threads(args.cpu_threads)

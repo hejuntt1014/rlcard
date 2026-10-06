@@ -31,7 +31,7 @@ inference ability or improved playing strength.
 `--history_steps 16` uses the most recent 16 valid records and has 6,023,956
 parameters (about 22.98 MiB). The environment still supplies the same 24-record
 feature protocol. Early games retain their available records; trailing padding is
-not mistaken for recent history. The default window remains 24 for a baseline,
+not mistaken for recent history. The default window is 24,
 and the checkpoint records the selected window. Changing it requires a new model.
 
 Candidate groups carry one observation per decision, a flat action array and
@@ -39,6 +39,9 @@ offsets. Each state is encoded once, and its context is reused across candidate
 actions. Declaration candidates use only the declaration head. Forced and
 epsilon-exploration choices skip network inference but still produce training
 samples. Invalid history slots are masked; chronological positions remain intact.
+`max_inference_actions` limits candidate rows per scoring forward. Unique states,
+candidate features and their indices are transferred as complete groups, so this
+setting is not a hard limit on total GPU memory.
 
 The native engine is required. `a3dizhu` remains available with its 850/52 feature
 layout and Python fallback. Feature schemas and model architectures are distinct;
@@ -60,6 +63,57 @@ Select `--history_encoder transformer` for the attention comparison, or
 `--architecture resnet` for a flat-observation residual policy on the same features.
 `--no-auxiliary` disables auxiliary heads and losses. Use separate experiment IDs
 for different model specifications.
+
+## Execution controls
+
+The A3 native collector automatically uses columnar rollout storage when the
+extension exposes `RolloutBuffer`. Observations, selected actions and decision-time
+auxiliary labels are recorded in contiguous C++ arrays. Completed episodes carry
+per-role NumPy columns directly to the shared-memory writer, which copies whole
+slices across unroll boundaries. Finished arrays retain their own storage across
+environment resets. Episode-length limits and reward/trajectory lengths are
+checked before publishing training data. Extensions without this interface use
+the compatible row-based collector and writer.
+
+Candidate actions use native indices when supported, avoiding action-string
+conversion during self-play. Fixed-rule resets invalidate cached candidates.
+Original-game-reward training skips cooperative step-reward calculations while
+retaining the same terminal game payoffs and decision records.
+
+Pinned host batches and dense learner scoring are enabled by default
+(`pin_memory=True`, `dense_learner=True`). Pinned buffers are reused only after
+their device reads finish. Dense scoring keeps mixed declaration/play batches at
+a fixed shape; homogeneous batches skip the inactive head and preserve absent
+gradients for that head.
+
+The following options are disabled by default and can be enabled independently:
+
+| Option | Behavior |
+| --- | --- |
+| `--compile_learner` | Compile state/action encoding, Q prediction, return regression loss and auxiliary losses together; gradient clipping and RMSprop remain eager |
+| `--actor_half_weights` | Store only actor `Linear` weights in BF16/FP16; normalization parameters stay FP32; requires CUDA actors and matching `--precision` |
+| `--actor_cuda_graphs` | Reuse bounded CUDA inference graphs for context encoding and action scoring; requires CUDA actors |
+
+Learner compilation requires PyTorch 2.x and a compatible `torch.compile` backend
+and compiler toolchain. `--compile_mode default` is the default mode;
+`reduce-overhead` and `max-autotune` are also available. Compilation and graph
+capture have startup costs and can increase memory use. Oversized inputs and
+additional sizes after the graph cache is full use eager inference. Saved weights
+remain FP32 with ordinary parameter names regardless of these execution options.
+
+The learner's `--learner_poll_interval` defaults to 0.002 seconds; the actor's
+`--actor_poll_interval` defaults to 0.005 seconds. Smaller values trade additional
+CPU polling for potentially shorter idle periods. The CLI uses `--cpu_threads 1`
+by default. In the Python API, `num_threads=None` preserves an existing PyTorch
+thread setting, and a positive value sets the learner process's thread count.
+
+`history_steps` and `unroll_length` control different things. The history window
+selects up to 24 records within each observation. Unroll length controls how many
+decision samples are packed into a shared-memory block. Each learner update uses
+`batch_size * unroll_length` samples; increasing this product reduces optimizer
+updates per frame. Changing 32 × 20 to 8 × 80 preserves 640 samples per update,
+without changing the model's history window. Throughput comparisons with larger
+update batches require separate playing-quality evaluation.
 
 ## Rules and rewards
 

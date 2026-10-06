@@ -1,5 +1,6 @@
 """Native rich-feature regressions and per-decision transport invariants."""
 import importlib.util
+import gc
 import random
 import unittest
 
@@ -12,6 +13,144 @@ class TestA3RichNative(unittest.TestCase):
     def setUpClass(cls):
         import a3dizhu_v12_cpp
         cls.native = a3dizhu_v12_cpp
+
+    def test_batch_arrays_survive_later_batches_and_engine_deletion(self):
+        vector = self.native.VectorizedEngine(2)
+        vector.seed(91)
+        for i in range(2):
+            vector.reset(i)
+        obs, actions, offsets, keys, players, auxiliary = vector.prepare_batch_with_metadata([0, 1])
+        expected = [array.copy() for array in (obs, actions, auxiliary)]
+        vector.step_batch([0, 1], [group[-1] for group in keys])
+        vector.prepare_indexed_batch([1, 0])
+        del vector
+        gc.collect()
+        for actual, saved in zip((obs, actions, auxiliary), expected):
+            np.testing.assert_array_equal(actual, saved)
+
+    def test_indexed_choices_expire_after_every_state_mutation(self):
+        mutations = ('reset', 'rules', 'step', 'random', 'indexed', 'rule_rollout')
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                vector = self.native.VectorizedEngine(1)
+                vector.seed(42)
+                if mutation == 'rule_rollout':
+                    vector.set_greedy_ratio(1.)
+                vector.reset(0)
+                vector.prepare_indexed_batch([0])
+                if mutation == 'reset':
+                    vector.reset(0)
+                elif mutation == 'rules':
+                    vector.set_rules(0, False, 1, 12)
+                elif mutation == 'step':
+                    vector.step(0, 'pass')
+                elif mutation == 'random':
+                    vector.step_random(0)
+                elif mutation == 'indexed':
+                    vector.step_choices([0], [0])
+                else:
+                    vector.advance_batch()
+                with self.assertRaises(ValueError):
+                    vector.step_choices([0], [0])
+
+    def test_invalid_indexed_batch_does_not_partially_step(self):
+        vector = self.native.VectorizedEngine(2)
+        vector.seed(51)
+        for i in range(2):
+            vector.reset(i)
+        obs, _, _, players, _ = vector.prepare_indexed_batch([0, 1])
+        before = obs.copy()
+        for indices, choices in (([0, 1], [0, 100000]), ([0, 0], [0, 0]),
+                                 ([0, 2], [0, 0]), ([0, -1], [0, 0]), ([0, 1], [0])):
+            with self.subTest(indices=indices, choices=choices):
+                with self.assertRaises((ValueError, IndexError)):
+                    vector.step_choices(indices, choices)
+                for i, player in enumerate(players):
+                    self.assertEqual(vector.get_player_id(i), player)
+                    np.testing.assert_array_equal(vector.encode_obs(i, player), before[i])
+        # Failed validation also preserves each environment's usable decision cache.
+        vector.step_choices([0, 1], [0, 0])
+
+    def test_disabled_reward_shaping_preserves_game_and_raw_payoffs(self):
+        shaped, raw = self.native.CppEngine(), self.native.CppEngine()
+        raw.set_reward_shaping(False)
+        hands = [
+            ['spade_4', 'spade_8', 'spade_9'],
+            ['diamond_4', 'diamond_8', 'diamond_9'],
+            ['club_4', 'club_8', 'club_9'],
+            ['heart_4', 'heart_8'],
+        ]
+        sequence = ['declare', 'diamond_4', 'pass', 'heart_4', 'spade_4',
+                    'diamond_8', 'club_8', 'heart_8']
+        # The option must persist across ordinary and explicit-deal resets.
+        for _ in range(2):
+            for engine in (shaped, raw):
+                engine.reset()
+                engine.reset_with_hands(hands, 1)
+                engine.set_rules(False, 1, 12)
+            for key in sequence:
+                self.assertEqual(shaped.get_player_id(), raw.get_player_id())
+                player = shaped.get_player_id()
+                np.testing.assert_array_equal(shaped.encode_obs(player), raw.encode_obs(player))
+                for engine in (shaped, raw):
+                    self.assertIn(key, engine.get_legal_actions())
+                    engine.step(key)
+            self.assertTrue(shaped.is_over())
+            self.assertTrue(raw.is_over())
+            np.testing.assert_array_equal(shaped.get_payoffs(), raw.get_payoffs())
+            shaped_rewards = []
+            for player in range(4):
+                expected, actual = shaped.get_step_rewards(player), raw.get_step_rewards(player)
+                self.assertEqual(len(expected), len(actual))
+                self.assertTrue(all(value == 0 for value in actual))
+                shaped_rewards.extend(expected)
+            self.assertTrue(any(value != 0 for value in shaped_rewards))
+
+    def test_column_rollout_preserves_selected_rows_targets_and_ownership(self):
+        buffer = self.native.RolloutBuffer(2, 20)
+        obs = np.arange(3 * 2668, dtype=np.int16).astype(np.int8).reshape(3, 2668)
+        actions = np.arange(4 * 111, dtype=np.int16).astype(np.int8).reshape(4, 111)
+        aux = np.arange(15, dtype=np.int64).reshape(3, 5)
+        buffer.record_choices([0, 1], [1, 0], obs[:2], actions, [0, 2, 4], [0, 1], aux[:2])
+        buffer.record_block(0, obs[1:], [1, 0], actions[2:], aux[1:])
+        first = buffer.finish(0, [2., 3., 4., 5.], [[.5, -.25], [.125], [], []])
+        self.assertEqual(buffer.size(0), 0)
+        self.assertEqual(buffer.size(1), 1)
+        np.testing.assert_array_equal(first[0]['state'], obs[[0, 2]])
+        np.testing.assert_array_equal(first[0]['action'], actions[[1, 3]])
+        np.testing.assert_array_equal(first[0]['aux_target'], aux[[0, 2]])
+        np.testing.assert_array_equal(first[0]['target'], [2.25, 1.75])
+        np.testing.assert_array_equal(first[0]['done'], [False, True])
+        np.testing.assert_array_equal(first[0]['episode_return'], [0., 2.25])
+        self.assertEqual(first[1]['target'][0], 3.125)
+        self.assertEqual(first[2]['state'].shape, (0, 2668))
+        second = buffer.finish(1, [1., 2., 3., 4.])
+        np.testing.assert_array_equal(second[1]['target'], [2.])
+        buffer.record_block(0, np.zeros_like(obs), [0, 0, 0], np.zeros_like(actions[:3]), np.zeros_like(aux))
+        buffer.clear(0)
+        del buffer
+        gc.collect()
+        np.testing.assert_array_equal(first[0]['state'], obs[[0, 2]])
+
+    def test_column_rollout_validation_and_length_bound_are_transactional(self):
+        buffer = self.native.RolloutBuffer(2, 1)
+        obs = np.zeros((2, 2668), np.int8)
+        actions = np.zeros((2, 111), np.int8)
+        aux = np.zeros((2, 5), np.int64)
+        for players, choices in (([0, 4], [0, 0]), ([0, 1], [0, 2])):
+            with self.assertRaises(ValueError):
+                buffer.record_choices([0, 1], choices, obs, actions, [0, 1, 2], players, aux)
+            self.assertEqual(buffer.size(0), 0)
+            self.assertEqual(buffer.size(1), 0)
+        buffer.record_block(1, obs[:1], [0], actions[:1], aux[:1])
+        with self.assertRaisesRegex(RuntimeError, 'max_episode_steps'):
+            buffer.record_choices([0, 1], [0, 0], obs, actions, [0, 1, 2], [0, 1], aux)
+        self.assertEqual(buffer.size(0), 0)
+        self.assertEqual(buffer.size(1), 1)
+        with self.assertRaises(ValueError):
+            buffer.finish(1, [1., 2., 3., 4.], [[], [], [], []])
+        self.assertEqual(buffer.size(1), 1)
+        self.assertEqual(buffer.finish(1, [1., 2., 3., 4.])[0]['target'][0], 1.)
 
     def test_afterstate_full_house_requires_distinct_pair_rank(self):
         triple = ['diamond_4', 'club_4', 'heart_4']

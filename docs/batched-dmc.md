@@ -106,7 +106,7 @@ are not accepted by this adapter.
 | Argument | Meaning |
 | --- | --- |
 | `share_weights` | Explicitly share one policy across all roles; shapes and role semantics must match |
-| `architecture` | `mlp` or `resnet`; defaults to MLP for standard games, ResNet for A3 |
+| `architecture` | `mlp`, `resnet`, or `context`; defaults to MLP for standard games, ResNet for `a3dizhu`, and context for `a3dizhu-v12` |
 | `auxiliary` | Optional A3 classification targets; use `False` with an A3 MLP |
 | `vectorized` | When false, use one environment per actor |
 | `envs_per_actor` | Number of games managed by one process |
@@ -115,14 +115,24 @@ are not accepted by this adapter.
 | `unroll_length` | Number of decision samples per block |
 | `num_buffers` | Slots per actor device and role; must be at least `batch_size` |
 | `weight_sync_interval` | Learner updates between actor weight publications |
-| `max_inference_actions` | Maximum candidate pairs in one model forward call |
+| `max_inference_actions` | Candidate rows per scoring forward; limits forward activations, not all device-resident inputs or total GPU memory |
 | `actor_timeout` | Seconds without a completed learner batch before failure |
 | `max_episode_steps` | Maximum recorded actions in a game before failure; no fabricated truncated targets |
+| `pin_memory` | Default `True`; CUDA learners reuse pinned host batches and weight snapshots with asynchronous transfers |
+| `dense_learner` | Default `True`; context learners use fixed-shape scoring for mixed declaration/play batches and skip unused heads in homogeneous batches |
+| `compile_learner` | Default `False`; compile the learner forward, return loss, and auxiliary losses together; clipping and optimizer updates remain eager |
+| `compile_mode` | Default `default`; CLI also accepts `reduce-overhead` and `max-autotune`; the Python API additionally accepts `max-autotune-no-cudagraphs` |
+| `actor_half_weights` | Default `False`; keep CUDA actor `Linear` weights in the selected BF16/FP16 dtype while retaining FP32 normalization parameters |
+| `actor_cuda_graphs` | Default `False`; context CUDA actors cache bounded inference graphs for compatible row-count buckets |
+| `learner_poll_interval` | Default `0.002` seconds; wait when no complete learner batch is available |
+| `actor_poll_interval` | Default `0.005` seconds; wait while trajectory output is congested |
+| `num_threads` | Python API only; default `None` preserves the current PyTorch CPU thread setting; a positive value sets it when training starts |
 
 Weight sharing is inappropriate for differently shaped roles such as the landlord
 and farmers in standard Dou Dizhu. Equal shapes alone do not establish game
-symmetry. `num_threads` is accepted by the trainer, but the learner uses one update
-loop. Policy publication uses versioned CPU snapshots and per-device locks. All
+symmetry. The learner uses one update loop. The CLI sets the PyTorch CPU thread
+count through `--cpu_threads`, whose default is 1. Actor workers use one PyTorch
+CPU thread each. Policy publication uses versioned CPU snapshots and per-device locks. All
 actors keep local inference models and refresh them from published snapshots.
 CPU actor forwards can run concurrently, and CUDA tensors do not cross process
 boundaries. Locks protect snapshot refresh rather than model inference.
@@ -132,6 +142,35 @@ or larger batches are not guaranteed to improve throughput. Queue backpressure
 pauses sampling; it does not silently drop completed samples. The shared-memory
 allocation has one tensor per field, device and role, rather than per buffer slot.
 
+One learner update consumes `batch_size * unroll_length` decision samples.
+Increasing this product reduces the number of optimizer updates per trained
+sample. To compare transport granularity at a fixed update frequency, keep the
+product constant: for example, 32 blocks of 20 and 8 blocks of 80 both contain
+640 samples. Pool sizes, actor counts and queue depth can also affect sample age
+and the mixture of games in each batch.
+
+`unroll_length` controls transport blocks. It does not control the A3 observation
+history window and does not introduce recurrent backpropagation across the block.
+Shorter polling intervals can reduce idle latency at the cost of more CPU polling;
+they must be finite and positive.
+
+## Optional compiled execution
+
+`--compile_learner` requires PyTorch 2.x and a working `torch.compile` backend and
+compiler toolchain for the selected platform and device. It is optional; ordinary
+training does not require the compilation toolchain. Context learners use the
+default dense path for compilation. Compilation and graph capture add startup
+work and may use additional memory, so report startup and sustained throughput
+separately. Different batch shapes or declaration phases can require separate
+compiled graphs.
+
+`--actor_half_weights` requires CUDA actors with `--precision bf16` or
+`--precision fp16`. `--actor_cuda_graphs` requires CUDA actors with the context
+architecture. Both options are independent of learner compilation. The graph
+cache is bounded and falls back to eager inference for oversized inputs or
+additional sizes after the cache is full. Precision and compiler choices can
+affect numerical results and should be evaluated on the intended model and hardware.
+
 ## Checkpoints and metrics
 
 Checkpoints are written atomically to `savedir/xpid/model.tar`. They include model
@@ -139,6 +178,9 @@ specification, weights, optimizer state, frame-based learning-rate state and
 statistics. `--load_model` requires a matching model specification and an existing
 checkpoint. Resume restarts actor games; it is not a bitwise replay of interrupted
 random streams. The learning-rate horizon follows the configured `total_frames`.
+Learner weights and saved model weights remain FP32 when mixed precision,
+half-precision actor weights or compilation are enabled. Compiled execution keeps
+the ordinary model parameter names in checkpoints.
 
 `frames` counts learner samples, and may exceed the requested target by less than
 one batch. `learner_updates` counts batches. `actor_steps` and `episodes` count

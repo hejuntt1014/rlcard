@@ -3,6 +3,7 @@
 #include <numeric>
 #include <cmath>
 #include <set>
+#include <stdexcept>
 
 namespace a3dizhu_v12 {
 
@@ -66,13 +67,29 @@ int string_to_card(const std::string& s) {
 std::string HandInfo::to_key() const {
     if (type == HAND_PASS) return "pass";
     if (type == HAND_DECLARE) return "declare";
-    std::vector<std::string> ids;
-    for_each_card(cards, [&](int c){ ids.push_back(card_to_string(c)); });
-    std::sort(ids.begin(), ids.end());
+    static const auto names = [] {
+        std::array<std::string, NUM_CARDS> result;
+        for (int c = 0; c < NUM_CARDS; ++c) result[c] = card_to_string(c);
+        return result;
+    }();
+    static const auto lexical_order = [] {
+        std::array<int, NUM_CARDS> ids, result;
+        std::iota(ids.begin(), ids.end(), 0);
+        std::sort(ids.begin(), ids.end(), [](int a, int b) { return names[a] < names[b]; });
+        for (int i = 0; i < NUM_CARDS; ++i) result[ids[i]] = i;
+        return result;
+    }();
+    std::array<int, NUM_CARDS> ids;
+    int count = 0;
+    size_t length = 0;
+    for_each_card(cards, [&](int c) { ids[count++] = c; length += names[c].size(); });
+    std::sort(ids.begin(), ids.begin() + count,
+              [](int a, int b) { return lexical_order[a] < lexical_order[b]; });
     std::string key;
-    for (size_t i = 0; i < ids.size(); i++) {
+    key.reserve(length + (count > 0 ? count - 1 : 0));
+    for (int i = 0; i < count; i++) {
         if (i > 0) key += '|';
-        key += ids[i];
+        key += names[ids[i]];
     }
     return key;
 }
@@ -978,21 +995,39 @@ float compute_step_reward(
 
 // ======================== Afterstate Computation ========================
 
+// Align 3..A with consecutive bits, excluding 2. Five overlapping shifted
+// masks identify every complete straight without enumerating eight sequences.
+static bool has_straight_ranks(uint16_t ranks, int start_val, int end_val) {
+    const unsigned ordered = ((ranks & 0x7ffu) << 1) | ((ranks >> 12) & 1u);
+    const unsigned starts = ordered & (ordered >> 1) & (ordered >> 2)
+                          & (ordered >> 3) & (ordered >> 4);
+    const unsigned allowed = ((1u << (end_val - 4)) - 1u)
+                           & ~((1u << (start_val - 1)) - 1u);
+    return (starts & allowed) != 0;
+}
+
 AfterstateInfo compute_afterstate(CardSet hand_after, int start_val, int end_val) {
     AfterstateInfo info;
     std::memset(&info, 0, sizeof(info));
     info.remaining_count = popcount64(hand_after);
 
-    int rank_count[NUM_RANKS] = {};
-    for_each_card(hand_after, [&](int c) {
-        rank_count[card_rank(c)]++;
-    });
-
-    for (int r = 0; r < NUM_RANKS; r++) {
-        if (rank_count[r] == 1) info.singles_count++;
-        else if (rank_count[r] == 2) info.pairs_count++;
-        else if (rank_count[r] == 3) info.triples_count++;
-    }
+    const uint16_t suits[4] = {
+        uint16_t(hand_after & 0x1fffu),
+        uint16_t((hand_after >> 13) & 0x1fffu),
+        uint16_t((hand_after >> 26) & 0x1fffu),
+        uint16_t((hand_after >> 39) & 0x1fffu)
+    };
+    const unsigned a = suits[0], b = suits[1], c = suits[2], d = suits[3];
+    const unsigned present = a | b | c | d;
+    const unsigned at_least_two = (a & b) | (a & c) | (a & d)
+                               | (b & c) | (b & d) | (c & d);
+    const unsigned at_least_three = (a & b & c) | (a & b & d)
+                                 | (a & c & d) | (b & c & d);
+    const unsigned four = a & b & c & d;
+    const unsigned singles = present & ~at_least_two;
+    info.singles_count = popcount64(singles);
+    info.pairs_count = popcount64(at_least_two & ~at_least_three);
+    info.triples_count = popcount64(at_least_three & ~four);
 
     int spade3 = make_card(3, 12);
     int spadeA = make_card(3, 10);
@@ -1000,60 +1035,28 @@ AfterstateInfo compute_afterstate(CardSet hand_after, int start_val, int end_val
     info.has_sa = (hand_after & card_bit(spadeA)) != 0;
 
     // rank 12 = '3' (strongest single), rank 11 = '2' (second strongest)
-    info.has_rank3_single = (rank_count[12] == 1);
-    info.has_rank2_single = (rank_count[11] == 1);
+    info.has_rank3_single = (singles & (1u << 12)) != 0;
+    info.has_rank2_single = (singles & (1u << 11)) != 0;
 
     // Straight potential: at least 5 consecutive ranks present
-    for (int si = 0; si < 8; si++) {
-        int seq_min = 99, seq_max = 0;
-        bool has_all = true;
-        for (int j = 0; j < 5; j++) {
-            int v = STRAIGHT_RANK_VAL[STRAIGHT_SEQS[si][j]];
-            seq_min = std::min(seq_min, v);
-            seq_max = std::max(seq_max, v);
-            if (rank_count[STRAIGHT_SEQS[si][j]] == 0) { has_all = false; break; }
-        }
-        if (has_all && seq_min >= start_val && seq_max <= end_val) {
-            info.has_straight_potential = true;
-            break;
-        }
-    }
+    info.has_straight_potential = has_straight_ranks(uint16_t(present), start_val, end_val);
 
     // Flush potential: 5+ cards of same suit
     for (int s = 0; s < NUM_SUITS; s++) {
-        int suit_cnt = popcount64(hand_after & suit_mask(s));
+        int suit_cnt = popcount64(suits[s]);
         if (suit_cnt >= 5) {
             info.has_flush_potential = true;
             if (info.has_straight_potential) {
-                // Check straight flush potential within this suit
-                CardSet sc = hand_after & suit_mask(s);
-                for (int si = 0; si < 8; si++) {
-                    int seq_min = 99, seq_max = 0;
-                    bool ok = true;
-                    for (int j = 0; j < 5; j++) {
-                        int v = STRAIGHT_RANK_VAL[STRAIGHT_SEQS[si][j]];
-                        seq_min = std::min(seq_min, v);
-                        seq_max = std::max(seq_max, v);
-                        if (!(sc & rank_mask(STRAIGHT_SEQS[si][j]))) { ok = false; break; }
-                    }
-                    if (ok && seq_min >= start_val && seq_max <= end_val) {
-                        info.has_sf_potential = true;
-                        break;
-                    }
-                }
+                info.has_sf_potential = has_straight_ranks(suits[s], start_val, end_val);
             }
             if (info.has_sf_potential) break;
         }
     }
 
     // Three+pair or four+one potential
-    int quads = 0;
-    int pair_ranks = 0, triple_ranks = 0;
-    for (int r = 0; r < NUM_RANKS; r++) {
-        if (rank_count[r] >= 4) quads++;
-        if (rank_count[r] >= 2) pair_ranks++;
-        if (rank_count[r] >= 3) triple_ranks++;
-    }
+    const int quads = popcount64(four);
+    const int pair_ranks = popcount64(at_least_two);
+    const int triple_ranks = popcount64(at_least_three);
     info.has_threepair_or_fourone_potential =
         (triple_ranks > 0 && pair_ranks >= 2) ||
         (quads > 0 && info.remaining_count >= 5);
@@ -1140,6 +1143,9 @@ int Engine::reset() {
 }
 
 void Engine::set_rules(bool declare_require_both_spades, int straight_start_val, int straight_end_val) {
+    if ((straight_start_val != 1 && straight_start_val != 2)
+        || (straight_end_val != 11 && straight_end_val != 12))
+        throw std::invalid_argument("Straight limits must be 1/2 and 11/12");
     state_.declare_require_both_spades = declare_require_both_spades;
     state_.straight_start_val = straight_start_val;
     state_.straight_end_val = straight_end_val;
@@ -1214,10 +1220,12 @@ HandInfo Engine::resolve_action(const std::string& key) const {
 }
 
 int Engine::step(const std::string& action_key) {
-    prev_state_ = state_;
-    int player_id = get_player_id();
+    return step_hand(resolve_action(action_key));
+}
 
-    HandInfo action = resolve_action(action_key);
+int Engine::step_hand(const HandInfo& action) {
+    if (reward_shaping_) prev_state_ = state_;
+    int player_id = get_player_id();
 
     if (!state_.is_declaration_phase) {
         action_history_.push_back({player_id, action});
@@ -1230,7 +1238,7 @@ int Engine::step(const std::string& action_key) {
 
     state_ = state_.apply_move(action);
 
-    float sr = compute_step_reward(prev_state_, action, state_, player_id);
+    float sr = reward_shaping_ ? compute_step_reward(prev_state_, action, state_, player_id) : 0.f;
     step_rewards_[player_id].push_back(sr);
 
     return get_player_id();
@@ -1377,13 +1385,14 @@ void Engine::encode_obs_static(int player_id, int8_t* out) const {
     }
 
     // [428:444] public_status_4p (4×4D: played_s3, played_sa, declared, finished)
-    std::set<int> finished_set(state_.rankings.begin(), state_.rankings.end());
+    bool finished_set[NUM_PLAYERS] = {};
+    for (int pid : state_.rankings) finished_set[pid] = true;
     for (int i = 0; i < n; i++) {
         int abs_i = rel_order[i];
         ptr[0] = (played_cards_[abs_i] & card_bit(spade3)) ? 1 : 0;
         ptr[1] = (played_cards_[abs_i] & card_bit(spadeA)) ? 1 : 0;
         ptr[2] = (state_.is_declared && abs_i == state_.declarant) ? 1 : 0;
-        ptr[3] = finished_set.count(abs_i) ? 1 : 0;
+        ptr[3] = finished_set[abs_i] ? 1 : 0;
         ptr += 4;
     }
 
@@ -1500,7 +1509,7 @@ void Engine::encode_obs_static(int player_id, int8_t* out) const {
     }
     for (int j = 1; j <= 3; j++) {
         int abs_j = rel_order[j];
-        *ptr++ = finished_set.count(abs_j) ? 1 : 0;  // finished
+        *ptr++ = finished_set[abs_j] ? 1 : 0;  // finished
     }
     // any_other_eq_1
     bool any_eq1 = false, any_le2 = false;
@@ -1706,12 +1715,13 @@ std::vector<Engine::ActionEntry> Engine::get_legal_actions() const {
     int pid = get_player_id();
 
     auto moves = state_.get_legal_moves();
+    result.reserve(moves.size());
     for (auto& h : moves) {
-        ActionEntry ae;
+        result.emplace_back();
+        auto& ae = result.back();
         ae.key = h.to_key();
         encode_action_feature(h, pid, ae.feature);
         key_to_hand_[ae.key] = h;
-        result.push_back(ae);
     }
     return result;
 }
@@ -1797,7 +1807,7 @@ std::string Engine::get_rule_agent_action() const {
 
 // ======================== VectorizedEngine ========================
 
-VectorizedEngine::VectorizedEngine(int n) : engines_(n), n_(n) {}
+VectorizedEngine::VectorizedEngine(int n) : engines_(n), indexed_actions_(n), n_(n) {}
 
 void VectorizedEngine::set_greedy_ratio(double r) {
     for (auto& e : engines_) e.set_greedy_ratio(r);
@@ -1805,15 +1815,47 @@ void VectorizedEngine::set_greedy_ratio(double r) {
 void VectorizedEngine::set_random_ratio(double r) {
     for (auto& e : engines_) e.set_random_ratio(r);
 }
+void VectorizedEngine::set_reward_shaping(bool enabled) {
+    for (auto& e : engines_) e.set_reward_shaping(enabled);
+}
 void VectorizedEngine::seed(unsigned int base) {
     for (int i = 0; i < n_; i++) engines_[i].seed(base + i);
 }
 
-int  VectorizedEngine::reset(int i)                          { return engines_[i].reset(); }
+int VectorizedEngine::reset(int i) {
+    indexed_actions_[i].clear();
+    return engines_[i].reset();
+}
 void VectorizedEngine::set_rules(int i, bool both, int start, int end) {
+    indexed_actions_[i].clear();
     engines_[i].set_rules(both, start, end);
 }
-int  VectorizedEngine::step(int i, const std::string& k)     { return engines_[i].step(k); }
+int VectorizedEngine::step(int i, const std::string& k) {
+    indexed_actions_[i].clear();
+    return engines_[i].step(k);
+}
+
+void VectorizedEngine::step_choices(const std::vector<int>& indices,
+                                    const std::vector<int>& choices) {
+    if (indices.size() != choices.size())
+        throw std::invalid_argument("One action choice is required per environment");
+    // Reject the entire request before mutating any environment.
+    std::vector<bool> seen(n_, false);
+    for (size_t row = 0; row < indices.size(); ++row) {
+        const int idx = indices[row], choice = choices[row];
+        if (idx < 0 || idx >= n_) throw std::out_of_range("Environment index out of range");
+        if (seen[idx]) throw std::invalid_argument("Duplicate environment index");
+        seen[idx] = true;
+        if (choice < 0 || choice >= (int)indexed_actions_[idx].size())
+            throw std::invalid_argument("Invalid or expired action choice; prepare an indexed batch first");
+    }
+    for (size_t row = 0; row < indices.size(); ++row) {
+        const int idx = indices[row];
+        const HandInfo action = indexed_actions_[idx][choices[row]];
+        indexed_actions_[idx].clear();
+        engines_[idx].step_hand(action);
+    }
+}
 int  VectorizedEngine::get_player_id(int i)           const  { return engines_[i].get_player_id(); }
 bool VectorizedEngine::is_over(int i)                 const  { return engines_[i].is_over(); }
 bool VectorizedEngine::is_rule_agent_seat(int i, int p) const { return engines_[i].is_rule_agent_seat(p); }
@@ -1857,7 +1899,7 @@ VectorizedEngine::advance_to_decision(int idx) {
         std::string key = engines_[idx].get_rule_agent_action();
         engines_[idx].get_action_feature(key, sd.action);
         sd.auxiliary = engines_[idx].get_aux_targets()[pid];
-        engines_[idx].step(key);
+        step(idx, key);
         steps.push_back(sd);
     }
     return {engines_[idx].is_over(), std::move(steps)};
@@ -1868,11 +1910,11 @@ int VectorizedEngine::step_random(int idx) {
     auto actions = engines_[idx].get_legal_actions();
     if (actions.empty()) return engines_[idx].get_player_id();
     int choice = std::rand() % (int)actions.size();
-    return engines_[idx].step(actions[choice].key);
+    return step(idx, actions[choice].key);
 }
 
 VectorizedEngine::BatchData
-VectorizedEngine::prepare_batch(const std::vector<int>& pending) const {
+VectorizedEngine::prepare_batch(const std::vector<int>& pending, bool indexed) const {
     BatchData bd;
     int K = (int)pending.size();
     bd.offsets.reserve(K + 1);
@@ -1890,6 +1932,18 @@ VectorizedEngine::prepare_batch(const std::vector<int>& pending) const {
         int8_t* obs_ptr = bd.obs_raw.data() + idx * STATE_DIM;
         engines_[e].encode_obs(pid, obs_ptr);
 
+        if (indexed) {
+            auto& moves = indexed_actions_[e];
+            moves = engines_[e].state_.get_legal_moves();
+            const size_t offset = bd.action_flat.size();
+            bd.action_flat.resize(offset + moves.size() * ACTION_DIM);
+            for (size_t row = 0; row < moves.size(); ++row)
+                engines_[e].encode_action_feature(moves[row], pid,
+                    bd.action_flat.data() + offset + row * ACTION_DIM);
+            bd.total_actions += (int)moves.size();
+            bd.offsets.push_back(bd.total_actions);
+            continue;
+        }
         auto actions = engines_[e].get_legal_actions();
         std::vector<std::string> keys;
         keys.reserve(actions.size());

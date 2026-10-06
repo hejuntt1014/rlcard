@@ -8,7 +8,7 @@ from collections import defaultdict
 import numpy as np
 import torch
 
-from .utils import TrajectoryWriter
+from .utils import TrajectoryWriter, ColumnTrajectoryWriter
 
 
 class EnvironmentFactory:
@@ -53,18 +53,24 @@ def score_actions(agent, observations, actions, max_actions, model_lock):
 
 
 def score_action_groups(agent, observations, actions, offsets, max_actions, model_lock):
-    """Transfer unique states once, then score variable-sized candidate groups."""
+    """Encode unique states once; bound candidate inputs/activations per forward."""
     offsets = np.asarray(offsets, dtype=np.int64)
     counts = np.diff(offsets)
     if len(offsets) != len(observations) + 1 or offsets[0] != 0 or offsets[-1] != len(actions) or np.any(counts <= 0):
         raise ValueError('Offsets must cover one nonempty candidate group per state')
     mapping = np.repeat(np.arange(len(observations)), counts)
-    net = agent.net
+    net = getattr(agent, 'inference_runner', agent.net)
     outputs = []
     dtype = getattr(agent, 'inference_dtype', None)
     amp = torch.autocast('cuda', dtype=dtype) if dtype is not None else contextlib.nullcontext()
     with model_lock, torch.no_grad(), amp:
         obs = torch.as_tensor(observations, device=agent.device).float()
+        # Keep ordinary batches on-device once, but do not turn the forward
+        # chunk limit into an unbounded allocation for large action spaces.
+        all_actions = (torch.as_tensor(actions, device=agent.device).float()
+                       if len(actions) <= max_actions else None)
+        all_indices = (torch.as_tensor(mapping, device=agent.device, dtype=torch.long)
+                       if all_actions is not None else None)
         reusable = hasattr(net, 'encode_state')
         encoded = net.encode_state(obs) if reusable else None
         # Known phase routing avoids CUDA nonzero synchronization in actor forwards.
@@ -73,12 +79,18 @@ def score_action_groups(agent, observations, actions, offsets, max_actions, mode
         for start in range(0, len(actions), max_actions):
             end = min(start + max_actions, len(actions))
             indices = mapping[start:end]
-            index = torch.as_tensor(indices, device=agent.device, dtype=torch.long)
-            act = torch.as_tensor(actions[start:end], device=agent.device).float()
+            index = (all_indices[start:end] if all_indices is not None else
+                     torch.as_tensor(indices, device=agent.device, dtype=torch.long))
+            act = (all_actions[start:end] if all_actions is not None else
+                   torch.as_tensor(actions[start:end], device=agent.device).float())
             if not reusable:
                 output = agent.forward(obs.index_select(0, index), act)
             elif declaration is None:
                 output = net.score_encoded(encoded, act, index)
+            elif not declaration[indices].any():
+                output = net.score_encoded(encoded, act, index, phase='play')
+            elif declaration[indices].all():
+                output = net.score_encoded(encoded, act, index, phase='declare')
             else:
                 output = torch.empty(end - start, device=agent.device, dtype=obs.dtype)
                 for is_declare, phase in ((False, 'play'), (True, 'declare')):
@@ -89,8 +101,24 @@ def score_action_groups(agent, observations, actions, offsets, max_actions, mode
                     values = net.score_encoded(encoded, act.index_select(0, selected),
                                                index.index_select(0, selected), phase=phase)
                     output.index_copy_(0, selected, values.to(output.dtype))
-            outputs.append(output)
+            # Graph runners reuse output storage on the next chunk replay.
+            outputs.append(output.clone() if hasattr(net, 'cache') and len(actions) > max_actions else output)
         return torch.cat(outputs).float().cpu().numpy()
+
+
+def segmented_argmax(values, offsets):
+    """First maximizing index in each nonempty group, matching NumPy NaNs."""
+    groups = len(offsets) - 1
+    # Tiny batches favor direct reductions; very wide action groups should not
+    # materialize several candidate-sized arrays just to avoid a few Python calls.
+    if groups < 32 or len(values) > groups * 64:
+        return np.asarray([values[left:right].argmax()
+                           for left, right in zip(offsets[:-1], offsets[1:])], dtype=np.int64)
+    maxima = np.maximum.reduceat(values, offsets[:-1])
+    expanded = np.repeat(maxima, np.diff(offsets))
+    matches = (values == expanded) | (np.isnan(values) & np.isnan(expanded))
+    candidates = np.where(matches, np.arange(len(values)), len(values))
+    return np.minimum.reduceat(candidates, offsets[:-1]) - offsets[:-1]
 
 
 def choose_action_indices(agent, observations, actions, offsets, epsilon, max_actions, model_lock):
@@ -111,12 +139,16 @@ def choose_action_indices(agent, observations, actions, offsets, epsilon, max_ac
         else:
             pending.append(i)
     if pending:
-        selected_actions = np.concatenate([actions[offsets[i]:offsets[i + 1]] for i in pending])
-        selected_offsets = np.cumsum([0] + [int(counts[i]) for i in pending])
-        values = score_action_groups(agent, np.asarray(observations)[pending], selected_actions,
+        if len(pending) == len(counts):
+            selected_actions, selected_offsets = actions, offsets
+            selected_observations = observations
+        else:
+            selected_actions = np.concatenate([actions[offsets[i]:offsets[i + 1]] for i in pending])
+            selected_offsets = np.cumsum([0] + [int(counts[i]) for i in pending])
+            selected_observations = np.asarray(observations)[pending]
+        values = score_action_groups(agent, selected_observations, selected_actions,
                                      selected_offsets, max_actions, model_lock)
-        for row, i in enumerate(pending):
-            choices[i] = values[selected_offsets[row]:selected_offsets[row + 1]].argmax()
+        choices[pending] = segmented_argmax(values, selected_offsets)
     return choices
 
 
@@ -254,7 +286,8 @@ class PythonPool:
 def actor_worker(actor_id, seed, env, model, model_lock, buffers,
                  free_queues, full_queues, stop, epsilon, errors, counters,
                  T, count, backend, adapter_class, max_actions, max_episode_steps,
-                 inference_device='cpu', policy_version=None, precision='fp32'):
+                 inference_device='cpu', policy_version=None, precision='fp32',
+                 actor_cuda_graphs=False, actor_half_weights=False, actor_poll_interval=.005):
     try:
         torch.set_num_threads(1)
         random.seed(seed)
@@ -272,12 +305,21 @@ def actor_worker(actor_id, seed, env, model, model_lock, buffers,
                 agent.net.to(agent.device)
                 agent.inference_dtype = (torch.bfloat16 if precision == 'bf16'
                                          else torch.float16 if precision == 'fp16' else None)
+                if actor_half_weights:
+                    for layer in agent.net.modules():
+                        if isinstance(layer, torch.nn.Linear):
+                            layer.to(dtype=agent.inference_dtype)
+                if actor_cuda_graphs:
+                    from .context_model import ContextInferenceGraphs
+                    agent.inference_runner = ContextInferenceGraphs(agent.net, dtype=agent.inference_dtype)
         if backend == 'cpp':
             from rlcard.envs.a3dizhu.dmc import NativePool
             pool = NativePool(env() if callable(env) else env, count, seed, max_episode_steps)
         else:
             pool = PythonPool(env, count, seed, adapter_class, max_episode_steps)
-        writer = TrajectoryWriter(T, free_queues, full_queues, buffers)
+        columnar = getattr(pool, 'columnar', False)
+        writer_type = ColumnTrajectoryWriter if columnar else TrajectoryWriter
+        writer = writer_type(T, free_queues, full_queues, buffers)
         while not stop.is_set():
             if policy_version.value != local_version:
                 with model_lock:
@@ -286,11 +328,14 @@ def actor_worker(actor_id, seed, env, model, model_lock, buffers,
                     local_version = policy_version.value
             writer.flush()
             if writer.congested():
-                stop.wait(.005)
+                stop.wait(actor_poll_interval)
                 continue
             episodes, steps = pool.round(model, epsilon.value, max_actions, inference_lock)
             for episode in episodes:
-                writer.add_episode(*episode)
+                if columnar:
+                    writer.add_episode(episode)
+                else:
+                    writer.add_episode(*episode)
             with counters.get_lock():
                 counters[0] += steps
                 counters[1] += len(episodes)

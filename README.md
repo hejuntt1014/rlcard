@@ -49,6 +49,8 @@ RLCard is a toolkit for Reinforcement Learning (RL) in card games. It supports m
 
 Train RLCard environments with per-role batched inference, bounded shared-memory buffers, and an optional C++ A3 backend. See the [training guide](docs/batched-dmc.md) for installation, CPU/GPU examples, benchmarks, and supported options.
 
+The [RTX 5060 throughput study](docs/benchmarks/training-optimization.md) includes reproducible actor, compiler, native rollout and MPS comparisons with fixed training-update size.
+
 ## Contributors
 The following games are mainly developed and maintained by community contributors. Thank you!
 *   Gin Rummy: [@billh0420](https://github.com/billh0420)

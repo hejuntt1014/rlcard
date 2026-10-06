@@ -11,7 +11,9 @@ import numpy as np
 import torch
 
 import rlcard
-from rlcard.agents.dmc_agent.collector import score_action_groups, choose_action_indices, PythonPool
+from rlcard.agents.dmc_agent.collector import (
+    score_action_groups, choose_action_indices, segmented_argmax, PythonPool,
+)
 from rlcard.agents.dmc_agent.model import DMCModel
 from rlcard.agents.dmc_agent.trainer import DMCTrainer, learn
 from rlcard.agents.dmc_agent.utils import create_buffers, TrajectoryWriter, BatchReader
@@ -22,6 +24,21 @@ class TestCompactScoring(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         torch.set_num_threads(1)
+
+    def test_segmented_argmax_preserves_first_ties_nan_and_infinity(self):
+        offsets = np.array([0, 3, 6, 8, 9, 11])
+        values = np.array([1, 3, 3, -np.inf, np.nan, np.nan, np.inf, np.inf,
+                           -np.inf, -0., 0.], dtype=np.float32)
+        np.testing.assert_array_equal(segmented_argmax(values, offsets), [1, 1, 0, 0, 0])
+        repeated_offsets = np.concatenate([offsets[:-1] + i * len(values) for i in range(8)] +
+                                          [np.array([len(values) * 8])])
+        np.testing.assert_array_equal(segmented_argmax(np.tile(values, 8), repeated_offsets),
+                                      np.tile([1, 1, 0, 0, 0], 8))
+        rng = np.random.default_rng(71)
+        offsets = np.concatenate(([0], np.cumsum(rng.integers(1, 25, 100))))
+        values = rng.standard_normal(offsets[-1]).astype(np.float32)
+        expected = [values[left:right].argmax() for left, right in zip(offsets[:-1], offsets[1:])]
+        np.testing.assert_array_equal(segmented_argmax(values, offsets), expected)
 
     def test_variable_candidates_encode_only_unique_states(self):
         model = DMCModel([[2668]], [[111]], [16], device='cpu',

@@ -263,6 +263,7 @@ public:
 
     void set_greedy_ratio(double r) { greedy_ratio_ = r; }
     void set_random_ratio(double r) { random_ratio_ = r; }
+    void set_reward_shaping(bool enabled) { reward_shaping_ = enabled; }
     void seed(unsigned int s);
 
     int  reset();
@@ -311,6 +312,8 @@ public:
     const GameState& game_state() const { return state_; }
 
 private:
+    friend class VectorizedEngine;
+    int step_hand(const HandInfo& action);
     GameState state_;
     GameState prev_state_;
 
@@ -324,6 +327,7 @@ private:
 
     double greedy_ratio_ = 0.0;
     double random_ratio_ = 0.0;
+    bool reward_shaping_ = true;
 
     enum SeatAgent : int8_t { SEAT_RL=0, SEAT_GREEDY=1, SEAT_RANDOM=2 };
     SeatAgent seat_agents_[NUM_PLAYERS];
@@ -372,6 +376,7 @@ public:
 
     void set_greedy_ratio(double r);
     void set_random_ratio(double r);
+    void set_reward_shaping(bool enabled);
     void seed(unsigned int base_seed);
 
     int  reset(int idx);
@@ -394,10 +399,12 @@ public:
 
     std::pair<bool, std::vector<RuleStepData>> advance_to_decision(int idx);
     int step_random(int idx);
-    BatchData prepare_batch(const std::vector<int>& pending) const;
+    BatchData prepare_batch(const std::vector<int>& pending, bool indexed = false) const;
+    void step_choices(const std::vector<int>& indices, const std::vector<int>& choices);
 
 private:
     std::vector<Engine> engines_;
+    mutable std::vector<std::vector<HandInfo>> indexed_actions_;
     int n_;
 };
 

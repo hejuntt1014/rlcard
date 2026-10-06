@@ -65,17 +65,21 @@ class FrameScheduler:
 
 def auxiliary_loss(logits, labels, classes, task_groups=None):
     """Masked categorical tasks without host-side tests on CUDA tensors."""
-    offset = 0
-    losses, active = [], []
-    for i, width in enumerate(classes):
-        valid = labels[:, i] >= 0
-        safe_labels = labels[:, i].clamp(min=0)
-        loss = F.cross_entropy(logits[:, offset:offset + width], safe_labels, reduction='none')
-        count = valid.sum()
-        losses.append((loss * valid).sum() / count.clamp(min=1))
-        active.append(count > 0)
-        offset += width
-    losses, active = torch.stack(losses), torch.stack(active)
+    width = max(classes)
+    if min(classes) == width:
+        task_logits = logits.reshape(-1, len(classes), width)
+    else:
+        task_logits = torch.stack([
+            F.pad(part, (0, width - part.shape[1]), value=-float('inf'))
+            if part.shape[1] < width else part
+            for part in logits.split(classes, dim=1)
+        ], dim=1)
+    valid = labels >= 0
+    loss = F.cross_entropy(task_logits.flatten(0, 1), labels.clamp(min=0).flatten(),
+                           reduction='none').view_as(labels)
+    counts = valid.sum(dim=0)
+    losses = (loss * valid).sum(dim=0) / counts.clamp(min=1)
+    active = counts > 0
     if task_groups is None:
         return losses.sum() / active.sum().clamp(min=1)
     result = losses.new_zeros(())
@@ -84,13 +88,42 @@ def auxiliary_loss(logits, labels, classes, task_groups=None):
     return result
 
 
+def _make_training_objective(forward, classes, groups, dense):
+    """Bind one agent's forward and loss configuration before compilation."""
+    def objective(state, action, target, labels, phase=None):
+        values, auxiliary = (forward(state, action, phase=phase) if dense
+                             else forward(state, action))
+        loss = compute_loss(values.float(), target.float())
+        if auxiliary is not None and labels is not None:
+            weight = .1 if groups is None else 1.
+            loss = loss + weight * auxiliary_loss(auxiliary.float(), labels, classes, groups)
+        return loss
+    return objective
+
+
 def learn(position, actor_models, agent, batch, optimizer, training_device,
           max_grad_norm, mean_episode_return_buf, lock=None, sync_weights=True,
-          aux_weight=.1, aux_groups=None, precision='fp32', scaler=None):
+          aux_weight=.1, aux_groups=None, precision='fp32', scaler=None,
+          transfer_done=None, learner_forward=None, dense_learner=False,
+          learner_objective=None):
     device = 'cuda:' + str(training_device) if training_device != 'cpu' else 'cpu'
-    state = batch['state'].to(device).flatten(0, 1).float()
-    action = batch['action'].to(device).flatten(0, 1).float()
-    target = batch['target'].to(device).flatten(0, 1)
+    phase = None
+    if dense_learner:
+        declaration = batch['state'].flatten(0, 1).flatten(1)[:, agent.net.declaration_flag_index] > .5
+        # Inspect the already-host-resident batch: a CUDA nonzero/all would
+        # synchronize the training stream. Homogeneous batches skip the unused
+        # head entirely, preserving None gradients and optimizer state.
+        if declaration.all().item():
+            phase = 'declare'
+        elif not declaration.any().item():
+            phase = 'play'
+    state = batch['state'].to(device, non_blocking=True).flatten(0, 1).float()
+    action = batch['action'].to(device, non_blocking=True).flatten(0, 1).float()
+    target = batch['target'].to(device, non_blocking=True).flatten(0, 1)
+    labels = (batch['aux_target'].to(device, non_blocking=True).flatten(0, 1).long()
+              if 'aux_target' in batch else None)
+    if transfer_done is not None:
+        transfer_done(device)
     returns = batch['episode_return'][batch['done']]
     if returns.numel():
         mean_episode_return_buf[position].append(float(returns.mean()))
@@ -98,12 +131,17 @@ def learn(position, actor_models, agent, batch, optimizer, training_device,
         amp = (torch.autocast('cuda', dtype=torch.bfloat16 if precision == 'bf16' else torch.float16)
                if device != 'cpu' and precision != 'fp32' else contextlib.nullcontext())
         with amp:
-            values, aux = agent.forward_with_aux(state, action)
-        loss = compute_loss(values.float(), target.float())
-        if aux is not None and 'aux_target' in batch:
-            labels = batch['aux_target'].to(device).flatten(0, 1).long()
-            weight = aux_weight if aux_groups is None else 1.
-            loss = loss + weight * auxiliary_loss(aux.float(), labels, agent.net.aux_classes, aux_groups)
+            if learner_objective is not None:
+                loss = learner_objective(state, action, target, labels, phase=phase)
+            else:
+                forward = learner_forward or agent.forward_with_aux
+                values, aux = (forward(state, action, phase=phase) if dense_learner
+                               else forward(state, action))
+        if learner_objective is None:
+            loss = compute_loss(values.float(), target.float())
+            if aux is not None and labels is not None:
+                weight = aux_weight if aux_groups is None else 1.
+                loss = loss + weight * auxiliary_loss(aux.float(), labels, agent.net.aux_classes, aux_groups)
         optimizer.zero_grad(set_to_none=True)
         if scaler is not None:
             scaler.scale(loss).backward()
@@ -118,7 +156,9 @@ def learn(position, actor_models, agent, batch, optimizer, training_device,
         if sync_weights:
             for model in actor_models.values():
                 model.get_agent(position).load_state_dict(agent.state_dict())
-    return loss.detach()
+    # Compiled objectives may return CUDA-graph-owned scalar storage. Statistics
+    # retain losses across updates, so do not expose storage reused by replay.
+    return loss.detach().clone() if learner_objective is not None else loss.detach()
 
 
 class DMCTrainer:
@@ -133,7 +173,7 @@ class DMCTrainer:
                  xpid='dmc', save_interval=30, num_actor_devices=1, num_actors=5,
                  training_device='0', savedir='experiments/dmc_result',
                  total_frames=100000000000, exp_epsilon=.01, batch_size=32,
-                 unroll_length=100, num_buffers=50, num_threads=4,
+                 unroll_length=100, num_buffers=50, num_threads=None,
                  max_grad_norm=40, learning_rate=.0001, alpha=.99, momentum=0,
                  epsilon=.00001, share_weights=False, initial_epsilon=None,
                  final_epsilon=None, epsilon_decay_ratio=.8, min_lr=1e-6,
@@ -142,7 +182,11 @@ class DMCTrainer:
                  weight_sync_interval=50, stats_interval=50,
                  max_inference_actions=4096, max_episode_steps=10000,
                  actor_timeout=120, adapter_class=None, env_factory=None, actor_on_cpu=False,
-                 history_encoder='mlp', precision='fp32', history_steps=24):
+                 history_encoder='mlp', precision='fp32', history_steps=24,
+                 pin_memory=True, dense_learner=True, compile_learner=False,
+                 compile_mode='default', actor_cuda_graphs=False,
+                 actor_half_weights=False, learner_poll_interval=.002,
+                 actor_poll_interval=.005):
         positive = dict(batch_size=batch_size, unroll_length=unroll_length,
                         num_buffers=num_buffers, num_actors=num_actors,
                         num_actor_devices=num_actor_devices, envs_per_actor=envs_per_actor,
@@ -152,6 +196,24 @@ class DMCTrainer:
             raise ValueError('Counts must be positive integers: ' + str(positive))
         if num_buffers < batch_size:
             raise ValueError('num_buffers must be >= batch_size')
+        if num_threads is not None and (type(num_threads) is not int or num_threads <= 0):
+            raise ValueError('num_threads must be a positive integer or None')
+        self.num_threads = num_threads
+        self.pin_memory = bool(pin_memory)
+        self.dense_learner = bool(dense_learner)
+        self.compile_learner = bool(compile_learner)
+        self.compile_mode = compile_mode
+        self.actor_cuda_graphs = bool(actor_cuda_graphs)
+        self.actor_half_weights = bool(actor_half_weights)
+        if (not math.isfinite(learner_poll_interval) or learner_poll_interval <= 0
+                or not math.isfinite(actor_poll_interval) or actor_poll_interval <= 0):
+            raise ValueError('Actor and learner polling intervals must be finite and positive')
+        self.learner_poll_interval = learner_poll_interval
+        self.actor_poll_interval = actor_poll_interval
+        if compile_learner and not hasattr(torch, 'compile'):
+            raise ValueError('compile_learner requires torch.compile support')
+        if compile_mode not in ('default', 'reduce-overhead', 'max-autotune', 'max-autotune-no-cudagraphs'):
+            raise ValueError('Unsupported compile_mode')
         if total_frames <= 0 or actor_timeout <= 0 or save_interval <= 0:
             raise ValueError('total_frames, actor_timeout and save_interval must be positive')
         if not 0 <= seed < 2**32 or not 0 < epsilon_decay_ratio <= 1:
@@ -237,6 +299,10 @@ class DMCTrainer:
         else:
             self.device_iterator = ['cpu']
             self.training_device = 'cpu'
+        if self.actor_cuda_graphs and (not cuda or actor_on_cpu or self.architecture != 'context'):
+            raise ValueError('actor_cuda_graphs requires CUDA actors and the context architecture')
+        if self.actor_half_weights and (not cuda or actor_on_cpu or precision == 'fp32'):
+            raise ValueError('actor_half_weights requires CUDA actors and bf16/fp16 precision')
         self.T, self.B = unroll_length, batch_size
         self.num_buffers, self.num_actors = num_buffers, num_actors
         self.envs_per_actor = envs_per_actor if vectorized else 1
@@ -279,8 +345,23 @@ class DMCTrainer:
                     rules=getattr(self.env, 'rules', None))
 
     def start(self):
+        if self.num_threads is not None:
+            torch.set_num_threads(self.num_threads)
         torch.manual_seed(self.seed)
         learner = self.model_func(self.training_device)
+        use_dense = self.dense_learner and self.architecture == 'context'
+        learner_forwards = {}
+        learner_objectives = {}
+        for agent in learner.get_agents():
+            if id(agent) in learner_forwards:
+                continue
+            forward = agent.net.forward_with_aux_dense if use_dense else agent.forward_with_aux
+            learner_forwards[id(agent)] = forward
+            if self.compile_learner:
+                objective = _make_training_objective(forward, agent.net.aux_classes,
+                                                     self.aux_groups, use_dense)
+                learner_objectives[id(agent)] = torch.compile(objective, mode=self.compile_mode,
+                                                              fullgraph=True, dynamic=False)
         optimizers = create_optimizers(self.num_players, self.learning_rate, self.momentum,
                                       self.epsilon, self.alpha, learner)
         unique_opts = list({id(o): o for o in optimizers}.values())
@@ -327,17 +408,24 @@ class DMCTrainer:
             free[device] = [ctx.Queue(maxsize=self.num_buffers) for _ in range(self.num_players)]
             full[device] = [ctx.Queue(maxsize=self.num_buffers) for _ in range(self.num_players)]
             for p in range(self.num_players):
-                models[device].get_agent(p).load_state_dict(learner.get_agent(p).state_dict())
+                if not self.share_weights or p == 0:
+                    models[device].get_agent(p).load_state_dict(learner.get_agent(p).state_dict())
                 for i in range(self.num_buffers):
                     free[device][p].put(i)
                 readers.append((device, p, BatchReader(free[device][p], full[device][p],
-                                                       buffers[device][p], self.B, batch_major=True)))
+                                                       buffers[device][p], self.B, batch_major=True,
+                                                       pin_memory=self.pin_memory and self.training_device != 'cpu')))
         self.plogger = FileWriter(self.xpid, xp_args=dict(
             model=self._model_spec(), backend=self.backend, seed=self.seed,
             batch_size=self.B, unroll_length=self.T, envs_per_actor=self.envs_per_actor,
             num_actors=self.num_actors, actor_devices=self.device_iterator,
             training_device=self.training_device, weight_sync_interval=self.weight_sync_interval,
-            precision=self.precision, env_config=getattr(self.env, '_creation_config', {})),
+            precision=self.precision, pin_memory=self.pin_memory and self.training_device != 'cpu',
+            dense_learner=use_dense, compile_learner=self.compile_learner,
+            compile_mode=self.compile_mode,
+            actor_cuda_graphs=self.actor_cuda_graphs, actor_half_weights=self.actor_half_weights,
+            learner_poll_interval=self.learner_poll_interval, actor_poll_interval=self.actor_poll_interval,
+            cpu_threads=torch.get_num_threads(), env_config=getattr(self.env, '_creation_config', {})),
             rootdir=self.savedir)
         self.actor_processes = []
         updates = self.frames // (self.T * self.B)
@@ -345,12 +433,23 @@ class DMCTrainer:
         last_checkpoint = last_log = last_batch = time.monotonic()
         start_time, start_frames = last_log, self.frames
         loss_totals = [[] for _ in range(self.num_players)]
+        positions = [0] if self.share_weights else range(self.num_players)
+        learner_states = {p: learner.get_agent(p).state_dict() for p in positions}
+        snapshot_pinned = self.pin_memory and self.training_device != 'cpu'
+        snapshots = {p: {k: torch.empty(v.shape, dtype=v.dtype, device='cpu',
+                                         pin_memory=snapshot_pinned)
+                         for k, v in state.items()}
+                     for p, state in learner_states.items()}
 
         def sync_models():
             # Copy each learner policy to the host once, then publish per-device.
-            positions = [0] if self.share_weights else range(self.num_players)
-            snapshots = {p: {k: v.detach().cpu().clone() for k, v in learner.get_agent(p).state_dict().items()}
-                         for p in positions}
+            for p, state in learner_states.items():
+                for key, value in state.items():
+                    snapshots[p][key].copy_(value.detach(), non_blocking=snapshot_pinned)
+            if snapshot_pinned:
+                # One stream fence for the whole snapshot, rather than a
+                # blocking .cpu() and fresh allocation for every parameter.
+                torch.cuda.current_stream(int(self.training_device)).synchronize()
             for device, model in models.items():
                 with locks[device]:
                     for p in ([0] if self.share_weights else range(self.num_players)):
@@ -383,7 +482,8 @@ class DMCTrainer:
                                   buffers[device], free[device], full[device], stop, exploration,
                                   errors, counter, self.T, self.envs_per_actor, self.backend,
                                   self.adapter_class, self.max_inference_actions, self.max_episode_steps,
-                                  device, versions[device], self.precision))
+                                  device, versions[device], self.precision,
+                                  self.actor_cuda_graphs, self.actor_half_weights, self.actor_poll_interval))
                         actor.start()
                         self.actor_processes.append(actor)
             while self.frames < self.total_frames:
@@ -402,10 +502,16 @@ class DMCTrainer:
                     batch = reader.get()
                     if batch is None:
                         continue
+                    if self.compile_learner and hasattr(getattr(torch, 'compiler', None), 'cudagraph_mark_step_begin'):
+                        torch.compiler.cudagraph_mark_step_begin()
                     loss = learn(p, {}, learner.get_agent(p), batch, optimizers[p],
                                  self.training_device, self.max_grad_norm,
                                  self.mean_episode_return_buf, sync_weights=False,
-                                 aux_groups=self.aux_groups, precision=self.precision, scaler=scaler)
+                                 aux_groups=self.aux_groups, precision=self.precision, scaler=scaler,
+                                 transfer_done=reader.mark_transferred,
+                                 learner_forward=learner_forwards[id(learner.get_agent(p))],
+                                 dense_learner=use_dense,
+                                 learner_objective=learner_objectives.get(id(learner.get_agent(p))))
                     loss_totals[p].append(loss)
                     self.frames += self.T * self.B
                     updates += 1
@@ -420,7 +526,7 @@ class DMCTrainer:
                         self._record_stats(loss_totals, counters, updates, exploration.value,
                                            optimizers[0].param_groups[0]['lr'], start_time, start_frames)
                 if not trained:
-                    stop.wait(.002)
+                    stop.wait(self.learner_poll_interval)
                 now = time.monotonic()
                 if now - last_batch > self.actor_timeout:
                     raise TimeoutError('No training batch within actor_timeout; check actor supply and batch size')

@@ -196,3 +196,120 @@ class ContextDMCNet(nn.Module):
         encoded = self.encode_state(obs)
         auxiliary = self.aux_head(encoded[0]) if self.aux_head is not None else None
         return self.score_encoded(encoded, actions), auxiliary
+
+    def forward_with_aux_dense(self, obs, actions, phase=None):
+        """Fixed-shape training graph without CUDA nonzero synchronization.
+
+        For mixed batches both decision heads are evaluated; ``where`` sends gradients only to the
+        selected head. This trades some unused play computation on declaration
+        rows for a graph suitable for compilation and CUDA graph replay. Actor
+        inference can still skip that computation with ``score_encoded`` phases.
+        A known homogeneous ``phase`` preserves absent gradients on the unused
+        head, including optimizer-state behavior.
+        """
+        context, declare = self.encode_state(obs)
+        actions = actions.flatten(1)
+        if phase is not None:
+            values = self.score_encoded((context, declare), actions, phase=phase)
+        else:
+            play_q = self._play_q(context, actions)
+            choice = (actions[:, :52].sum(1) > 26).long()
+            declare_q = self.declare_head(context).gather(1, choice.unsqueeze(1)).flatten()
+            values = torch.where(declare, declare_q, play_q)
+        auxiliary = self.aux_head(context) if self.aux_head is not None else None
+        return values, auxiliary
+
+
+class ContextInferenceGraphs:
+    """Bounded, lazy CUDA-graph cache for an actor-local context network.
+
+    The network must stay in eval mode on one CUDA device. Parameters may be
+    refreshed in place with ``load_state_dict`` between calls. Returned tensors
+    alias graph-owned storage and must be consumed before the same graph replays.
+    Small batches use powers of two; larger batches use multiples of 64 by
+    default. Set ``bucket_multiple=0`` for powers of two throughout. Finer buckets
+    reduce padded computation at the cost of more cached graphs. Independent rows make
+    padded slots irrelevant. CPU and oversized batches use the eager network.
+    """
+
+    declaration_flag_index = DECLARE_FLAG_INDEX
+
+    def __init__(self, net, dtype=None, max_graphs=12, max_rows=4096, bucket_multiple=64):
+        if max_graphs < 1 or max_rows < 1 or bucket_multiple < 0:
+            raise ValueError('Graph limits must be positive')
+        self.net, self.dtype = net, dtype
+        self.max_graphs, self.max_rows = max_graphs, max_rows
+        self.bucket_multiple = bucket_multiple
+        self.cache = {}
+        self.hits = 0
+        self.misses = 0
+
+    def _run(self, kind, inputs, function):
+        if inputs[0].device.type != 'cuda':
+            return function(*inputs)
+        eager_function = function
+
+        def function(*values):
+            # Capture casts themselves: cached half weights would otherwise
+            # become stale after the actor receives a new FP32 snapshot.
+            with torch.autocast('cuda', enabled=self.dtype is not None,
+                                dtype=self.dtype or torch.float16, cache_enabled=False):
+                return eager_function(*values)
+
+        if (self.net.training or torch.is_grad_enabled() or not len(inputs[0])
+                or len(inputs[0]) > self.max_rows):
+            return function(*inputs)
+        rows = len(inputs[0])
+        if self.bucket_multiple and rows > 128:
+            bucket = ((rows + self.bucket_multiple - 1) // self.bucket_multiple) * self.bucket_multiple
+        else:
+            bucket = 1 << (rows - 1).bit_length()
+        key = (kind, bucket, tuple((x.dtype, tuple(x.shape[1:])) for x in inputs))
+        entry = self.cache.get(key)
+        if entry is None:
+            if len(self.cache) >= self.max_graphs:
+                return function(*inputs)
+            self.misses += 1
+            buffers = tuple(torch.zeros((bucket, *x.shape[1:]), device=x.device, dtype=x.dtype)
+                            for x in inputs)
+            for buffer, value in zip(buffers, inputs):
+                buffer[:rows].copy_(value)
+            current = torch.cuda.current_stream(inputs[0].device)
+            warmup = torch.cuda.Stream(device=inputs[0].device)
+            warmup.wait_stream(current)
+            with torch.cuda.stream(warmup):
+                for _ in range(3):
+                    function(*buffers)
+            current.wait_stream(warmup)
+            with torch.cuda.device(inputs[0].device):
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    output = function(*buffers)
+            entry = (graph, buffers, output)
+            self.cache[key] = entry
+        else:
+            self.hits += 1
+        graph, buffers, output = entry
+        for buffer, value in zip(buffers, inputs):
+            buffer[:rows].copy_(value)
+        graph.replay()
+        if isinstance(output, tuple):
+            return tuple(value[:rows] for value in output)
+        return output[:rows]
+
+    def encode_state(self, obs):
+        return self._run('encode', (obs,), self.net.encode_state)
+
+    def score_encoded(self, encoded, actions, state_indices=None, phase=None):
+        if phase not in ('play', 'declare'):
+            return self.net.score_encoded(encoded, actions, state_indices, phase=phase)
+        context = encoded[0]
+        if state_indices is not None:
+            context = context.index_select(0, state_indices)
+        if phase == 'play':
+            return self._run('play', (context, actions), self.net._play_q)
+
+        def declare(context, actions):
+            choice = (actions[:, :52].sum(1) > 26).long()
+            return self.net.declare_head(context).gather(1, choice.unsqueeze(1)).flatten()
+        return self._run('declare', (context, actions), declare)
