@@ -6,6 +6,23 @@ on:
 permissions:
   contents: read
 jobs:
+  evaluation:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: evaluation
+    env:
+      ONNXRUNTIME_NODE_INSTALL: skip
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: evaluation/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - run: npm run check
+      - run: npm test
   test:
     strategy:
       fail-fast: false

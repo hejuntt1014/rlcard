@@ -27,3 +27,10 @@ project and retain their source-level license notices.
 Dependency packages are distributed under their respective licenses. Project
 naming and repository ownership do not replace the notices attached to included
 third-party source code.
+
+## A3 evaluation reference
+
+`evaluation/` includes game and reference-policy code supplied from the user's
+A3 project. Its source boundaries and adaptations are recorded in
+[evaluation/SOURCES.md](evaluation/SOURCES.md). No server configuration,
+credentials or pretrained model binaries are included.

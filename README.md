@@ -53,6 +53,8 @@ The [RTX 5060 throughput study](docs/benchmarks/training-optimization.md) includ
 
 The [complete-update replay study](docs/benchmarks/training-optimization-round2.md) compares compiled optimizers, shared index rings and threaded actors on the same update size.
 
+The isolated [A3 evaluation package](evaluation/README.md) provides bounded CPU evaluation against `rule_ultra`, batched ONNX inference and checkpoint tracking.
+
 ## Contributors
 The following games are mainly developed and maintained by community contributors. Thank you!
 *   Gin Rummy: [@billh0420](https://github.com/billh0420)
