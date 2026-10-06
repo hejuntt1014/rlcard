@@ -1,7 +1,7 @@
 # RLCard: 卡牌游戏强化学习工具包
 <img width="500" src="https://dczha.com/files/rlcard/logo.jpg" alt="Logo" />
 
-[![Testing](https://github.com/datamllab/rlcard/actions/workflows/python-package.yml/badge.svg)](https://github.com/datamllab/rlcard/actions/workflows/python-package.yml)
+[![Testing](https://github.com/hejuntt1014/rlcard/actions/workflows/python-package.yml/badge.svg)](https://github.com/hejuntt1014/rlcard/actions/workflows/python-package.yml)
 [![PyPI version](https://badge.fury.io/py/rlcard.svg)](https://badge.fury.io/py/rlcard)
 [![Coverage Status](https://coveralls.io/repos/github/datamllab/rlcard/badge.svg)](https://coveralls.io/github/datamllab/rlcard?branch=master)
 [![Downloads](https://pepy.tech/badge/rlcard)](https://pepy.tech/project/rlcard)
@@ -42,6 +42,10 @@ RLCard是一款卡牌游戏强化学习 (Reinforcement Learning, RL) 的工具�
 *   无限注德州扑克人机界面现已可用。无限注德州扑克的动作空间已被抽象化。感谢[@AdrianP-](https://github.com/AdrianP-)做出的贡献。
 *   新游戏Gin Rummy以及其可视化人机界面现已可用，感谢[@billh0420](https://github.com/billh0420)做出的贡献。
 *   PyTorch实现现已可用，感谢[@mjudell](https://github.com/mjudell)做出的恭喜。
+
+## 批量 DMC 训练
+
+支持多环境批量推理、按角色独立策略、连续共享内存缓冲区，以及可选的 A3 C++ 后端。安装、CPU/GPU 训练、基准测试与配置见[训练指南](docs/batched-dmc.md)。
 
 ## 引用
 如果本项目对您有帮助，请添加引用：

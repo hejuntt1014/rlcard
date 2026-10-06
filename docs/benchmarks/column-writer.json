@@ -1,0 +1,152 @@
+{
+  "frames": 10713,
+  "games": 128,
+  "results": [
+    {
+      "mode": "accumulated",
+      "T": 20,
+      "TrajectoryWriter": {
+        "median_ms": 18.078750057611614,
+        "samples_ms": [
+          21.568099968135357,
+          18.32940010353923,
+          18.42680003028363,
+          17.595199984498322,
+          17.47679989784956,
+          17.828100011684
+        ]
+      },
+      "ColumnTrajectoryWriter": {
+        "median_ms": 5.508999980520457,
+        "samples_ms": [
+          5.496299942024052,
+          5.463199922814965,
+          5.607699975371361,
+          5.3813999984413385,
+          5.521700019016862,
+          6.976999924518168
+        ]
+      }
+    },
+    {
+      "mode": "accumulated",
+      "T": 80,
+      "TrajectoryWriter": {
+        "median_ms": 16.31079998333007,
+        "samples_ms": [
+          15.853999997489154,
+          16.201999969780445,
+          16.596399946138263,
+          16.419599996879697,
+          15.961500001139939,
+          16.4504999993369
+        ]
+      },
+      "ColumnTrajectoryWriter": {
+        "median_ms": 4.717100004199892,
+        "samples_ms": [
+          4.807200049981475,
+          4.559600027278066,
+          4.691399983130395,
+          4.742800025269389,
+          4.503399948589504,
+          5.1367999985814095
+        ]
+      }
+    },
+    {
+      "mode": "streaming",
+      "T": 20,
+      "TrajectoryWriter": {
+        "median_ms": 22.158449981361628,
+        "samples_ms": [
+          20.10239998344332,
+          21.982899983413517,
+          22.333999979309738,
+          24.28350003901869,
+          21.238300018012524,
+          22.79600000474602
+        ]
+      },
+      "ColumnTrajectoryWriter": {
+        "median_ms": 7.153350044973195,
+        "samples_ms": [
+          6.816199980676174,
+          7.8437000047415495,
+          7.362400065176189,
+          6.610499927774072,
+          7.567099994048476,
+          6.9443000247702
+        ]
+      }
+    },
+    {
+      "mode": "streaming",
+      "T": 80,
+      "TrajectoryWriter": {
+        "median_ms": 16.6780999279581,
+        "samples_ms": [
+          16.765599953942,
+          15.980199910700321,
+          16.89650001935661,
+          16.5905999019742,
+          15.867299982346594,
+          16.910600010305643
+        ]
+      },
+      "ColumnTrajectoryWriter": {
+        "median_ms": 5.265849933493882,
+        "samples_ms": [
+          4.590700031258166,
+          5.872500012628734,
+          5.43139991350472,
+          5.100299953483045,
+          5.0351000390946865,
+          6.223400007002056
+        ]
+      }
+    }
+  ],
+  "date": "2026-10-06",
+  "hardware": {
+    "cpu": "Intel(R) Core(TM) Ultra 7 258V",
+    "os": "Windows",
+    "python": "3.12.10",
+    "torch": "2.10.0+cpu",
+    "numpy": "2.4.3",
+    "torch_threads": 1
+  },
+  "fixture": {
+    "env": "a3dizhu-v12",
+    "reward_mode": "game",
+    "pool_size": 32,
+    "native_seed": 42,
+    "numpy_seed": 42,
+    "epsilon": 1.0,
+    "native_pool_path": "compatibility row collector",
+    "input_decision_samples": 10713,
+    "completed_episodes": 128,
+    "published_decision_samples": null
+  },
+  "method": {
+    "timer": "time.perf_counter",
+    "repetitions_per_case": 6,
+    "reported_statistic": "median milliseconds",
+    "raw_repetition_samples_retained": true,
+    "baseline": "Current NumPy-batched TrajectoryWriter; not the earlier per-unroll torch copy baseline",
+    "optimized": "ColumnTrajectoryWriter retains per-role column arrays and copies slices into contiguous shared slot runs",
+    "timer_includes": "add_episode, flush, draining full queues and returning indices",
+    "timer_excludes": "Native rollout, fixture conversion, shared buffer/queue/writer construction, validation copies",
+    "queues": "queue.Queue in one process; no multiprocessing IPC",
+    "accumulated": "Add all 128 episodes then flush; sufficient free slots for all complete unrolls",
+    "streaming": "Eight slots per role; add one episode, flush and immediately consume/return slots",
+    "validation": "Separate untimed pass comparing every published state/action/target/done/episode_return/aux_target tensor against the row writer at rtol=0 and atol=0; all matched"
+  },
+  "limitations": [
+    "This measures writer cost only, not training throughput.",
+    "Column fixtures were prepared before timing. Production native column construction is not measured here.",
+    "The laptop CPU differs from the PVE training server.",
+    "Input sample count includes incomplete unroll tails; actual published sample count was not retained.",
+    "One fixed rollout seed and exploration-only games are used."
+  ]
+}

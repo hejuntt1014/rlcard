@@ -29,6 +29,8 @@ class EnvSpec(object):
             config (dict): A dictionary of the environment settings
         '''
         env = self._entry_point(config)
+        env._creation_config = dict(config)
+        env._creation_entry_point = self._entry_point
         return env
 
 class EnvRegistry(object):

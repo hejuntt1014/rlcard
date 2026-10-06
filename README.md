@@ -1,7 +1,7 @@
 # RLCard: A Toolkit for Reinforcement Learning in Card Games
 <img width="500" src="https://dczha.com/files/rlcard/logo.jpg" alt="Logo" />
 
-[![Testing](https://github.com/datamllab/rlcard/actions/workflows/python-package.yml/badge.svg)](https://github.com/datamllab/rlcard/actions/workflows/python-package.yml)
+[![Testing](https://github.com/hejuntt1014/rlcard/actions/workflows/python-package.yml/badge.svg)](https://github.com/hejuntt1014/rlcard/actions/workflows/python-package.yml)
 [![PyPI version](https://badge.fury.io/py/rlcard.svg)](https://badge.fury.io/py/rlcard)
 [![Coverage Status](https://coveralls.io/repos/github/datamllab/rlcard/badge.svg)](https://coveralls.io/github/datamllab/rlcard?branch=master)
 [![Downloads](https://pepy.tech/badge/rlcard)](https://pepy.tech/project/rlcard)
@@ -44,6 +44,16 @@ RLCard is a toolkit for Reinforcement Learning (RL) in card games. It supports m
 *   Human interface of NoLimit Holdem available. The action space of NoLimit Holdem has been abstracted. Thanks for the contribution of [@AdrianP-](https://github.com/AdrianP-).
 *   New game Gin Rummy and human GUI available. Thanks for the contribution of [@billh0420](https://github.com/billh0420).
 *   PyTorch implementation available. Thanks for the contribution of [@mjudell](https://github.com/mjudell).
+
+## Batched DMC training
+
+Train RLCard environments with per-role batched inference, bounded shared-memory buffers, and an optional C++ A3 backend. See the [training guide](docs/batched-dmc.md) for installation, CPU/GPU examples, benchmarks, and supported options.
+
+The [RTX 5060 throughput study](docs/benchmarks/training-optimization.md) includes reproducible actor, compiler, native rollout and MPS comparisons with fixed training-update size.
+
+The [complete-update replay study](docs/benchmarks/training-optimization-round2.md) compares compiled optimizers, shared index rings and threaded actors on the same update size.
+
+The isolated [A3 evaluation package](evaluation/README.md) provides bounded CPU evaluation against `rule_ultra`, batched ONNX inference and checkpoint tracking.
 
 ## Contributors
 The following games are mainly developed and maintained by community contributors. Thank you!

@@ -5,6 +5,8 @@ with open("README.md", "r", encoding="utf8") as fh:
 
 extras = {
     'torch': ['torch', 'GitPython', 'gitdb2', 'matplotlib'],
+    'cpp': ['pybind11>=2.12'],
+    'test': ['pytest', 'pettingzoo[classic]'],
 }
 
 def _get_version():
@@ -42,13 +44,11 @@ setuptools.setup(
         'termcolor'
     ],
     extras_require=extras,
-    requires_python='>=3.7',
+    python_requires='>=3.10',
     classifiers=[
         "Programming Language :: Python :: 3.11",
         "Programming Language :: Python :: 3.10",
-        "Programming Language :: Python :: 3.9",
-        "Programming Language :: Python :: 3.8",
-        "Programming Language :: Python :: 3.7",
+        "Programming Language :: Python :: 3.12",
         "License :: OSI Approved :: MIT License",
         "Operating System :: OS Independent",
     ],

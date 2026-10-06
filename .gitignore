@@ -1,5 +1,13 @@
 **/.DS_Store
 __pycache__/
+.venv/
+.pytest_cache/
+build/
+*.pyd
+*.so
+*.obj
+*.lib
+*.exp
 *.pyc
 /*.egg-info
 .idea/
@@ -15,5 +23,9 @@ docs/rst
 docs/sphinx
 experiments/
 dist/
+evaluation/node_modules/
+evaluation/artifacts/
+evaluation/results/
+evaluation/local.json
 rlcard/games/doudizhu/jsondata/
 rlcard/agents/gin_rummy_human_agent/gui_cards/cards_png

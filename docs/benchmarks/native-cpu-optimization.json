@@ -1,0 +1,577 @@
+{
+  "hardware": "Intel Core Ultra 7 258V, Windows 11, MSVC 14.44 /O2 /GL",
+  "baseline_commit": "61529750a65da65353d9d271df517c02706a0c60",
+  "method": "CPU-only native rollout with Python random action selection; no model inference or learner; same seed and decision path, baseline independently rebuilt in isolated directory. Throughput figures exclude fingerprint hashing.",
+  "summary": {
+    "before_decisions_per_second": 170831.39167851978,
+    "after_decisions_per_second": 370787.86771131953,
+    "ratio": 2.1704902364144476,
+    "indexed_decisions_per_second": 383459.8857901794,
+    "indexed_vs_baseline_ratio": 2.2446687463144714
+  },
+  "boundary_checks": {
+    "straight_rank_presence_masks": 8192,
+    "rule_combinations": 4,
+    "straight_and_straight_flush_oracle_cases": 32768,
+    "zero_copy_lifetime_after_step_prepare_engine_deletion": true,
+    "empty_batch_shapes": true,
+    "invalid_batch_indices_rejected": true,
+    "indexed_cache_invalidated_by": [
+      "reset",
+      "set_rules",
+      "step",
+      "step_random",
+      "advance_to_decision_with_rule_steps",
+      "step_choices"
+    ],
+    "step_choices_rejects_entire_invalid_batch_before_mutation": true,
+    "indexed_fingerprint_does_not_populate_string_action_cache": true
+  },
+  "experiments": {
+    "native-before-long": {
+      "python": "3.12.10",
+      "platform": "Windows-11-10.0.26200-SP0",
+      "config": {
+        "envs": 128,
+        "rounds": 10000,
+        "seed": 42,
+        "repeats": 3,
+        "batch": false,
+        "fingerprint": false,
+        "greedy": 0.0,
+        "no_shaping": false,
+        "output": "../native-before-long.json"
+      },
+      "runs": [
+        {
+          "seconds": 7.32769000006374,
+          "decisions": 1264782,
+          "decisions_per_second": 172603.0986557835,
+          "candidates": 4081753,
+          "games": 15218,
+          "fingerprint": null
+        },
+        {
+          "seconds": 7.403686099918559,
+          "decisions": 1264782,
+          "decisions_per_second": 170831.39167851978,
+          "candidates": 4081753,
+          "games": 15218,
+          "fingerprint": null
+        },
+        {
+          "seconds": 7.477307500084862,
+          "decisions": 1264782,
+          "decisions_per_second": 169149.38966809184,
+          "candidates": 4081753,
+          "games": 15218,
+          "fingerprint": null
+        }
+      ]
+    },
+    "native-final-long": {
+      "python": "3.12.10",
+      "platform": "Windows-11-10.0.26200-SP0",
+      "config": {
+        "envs": 128,
+        "rounds": 10000,
+        "seed": 42,
+        "repeats": 3,
+        "batch": true,
+        "fingerprint": false,
+        "greedy": 0.0,
+        "no_shaping": true,
+        "output": "experiments/native-final-long.json"
+      },
+      "runs": [
+        {
+          "seconds": 3.4109512999420986,
+          "decisions": 1264782,
+          "decisions_per_second": 370800.3688066346,
+          "candidates": 4081753,
+          "games": 15218,
+          "fingerprint": null
+        },
+        {
+          "seconds": 3.411066300002858,
+          "decisions": 1264782,
+          "decisions_per_second": 370787.86771131953,
+          "candidates": 4081753,
+          "games": 15218,
+          "fingerprint": null
+        },
+        {
+          "seconds": 3.475758499931544,
+          "decisions": 1264782,
+          "decisions_per_second": 363886.6164104641,
+          "candidates": 4081753,
+          "games": 15218,
+          "fingerprint": null
+        }
+      ]
+    },
+    "native-before": {
+      "python": "3.12.10",
+      "platform": "Windows-11-10.0.26200-SP0",
+      "config": {
+        "envs": 128,
+        "rounds": 1000,
+        "seed": 42,
+        "repeats": 3,
+        "batch": false,
+        "fingerprint": false,
+        "greedy": 0.0,
+        "no_shaping": false,
+        "output": "experiments/native-before.json"
+      },
+      "runs": [
+        {
+          "seconds": 0.882948899990879,
+          "decisions": 126539,
+          "decisions_per_second": 143314.0694793404,
+          "candidates": 410246,
+          "games": 1461,
+          "fingerprint": null
+        },
+        {
+          "seconds": 0.7491944999201223,
+          "decisions": 126539,
+          "decisions_per_second": 168900.06535484624,
+          "candidates": 410246,
+          "games": 1461,
+          "fingerprint": null
+        },
+        {
+          "seconds": 0.7583641998935491,
+          "decisions": 126539,
+          "decisions_per_second": 166857.82374453088,
+          "candidates": 410246,
+          "games": 1461,
+          "fingerprint": null
+        }
+      ]
+    },
+    "native-batch": {
+      "python": "3.12.10",
+      "platform": "Windows-11-10.0.26200-SP0",
+      "config": {
+        "envs": 128,
+        "rounds": 1000,
+        "seed": 42,
+        "repeats": 3,
+        "batch": true,
+        "fingerprint": false,
+        "greedy": 0.0,
+        "no_shaping": true,
+        "output": "experiments/native-batch.json"
+      },
+      "runs": [
+        {
+          "seconds": 0.49618709995411336,
+          "decisions": 126539,
+          "decisions_per_second": 255022.75252964484,
+          "candidates": 410246,
+          "games": 1461,
+          "fingerprint": null
+        },
+        {
+          "seconds": 0.5062222999986261,
+          "decisions": 126539,
+          "decisions_per_second": 249967.25746839566,
+          "candidates": 410246,
+          "games": 1461,
+          "fingerprint": null
+        },
+        {
+          "seconds": 0.4984774000477046,
+          "decisions": 126539,
+          "decisions_per_second": 253851.027123577,
+          "candidates": 410246,
+          "games": 1461,
+          "fingerprint": null
+        }
+      ]
+    },
+    "native-bitset": {
+      "python": "3.12.10",
+      "platform": "Windows-11-10.0.26200-SP0",
+      "config": {
+        "envs": 128,
+        "rounds": 1000,
+        "seed": 42,
+        "repeats": 3,
+        "batch": true,
+        "fingerprint": false,
+        "greedy": 0.0,
+        "no_shaping": true,
+        "output": "experiments/native-bitset.json"
+      },
+      "runs": [
+        {
+          "seconds": 0.45033639995381236,
+          "decisions": 126539,
+          "decisions_per_second": 280987.72387259424,
+          "candidates": 410246,
+          "games": 1461,
+          "fingerprint": null
+        },
+        {
+          "seconds": 0.4766456000506878,
+          "decisions": 126539,
+          "decisions_per_second": 265478.16655927064,
+          "candidates": 410246,
+          "games": 1461,
+          "fingerprint": null
+        },
+        {
+          "seconds": 0.4378735999343917,
+          "decisions": 126539,
+          "decisions_per_second": 288985.2231761856,
+          "candidates": 410246,
+          "games": 1461,
+          "fingerprint": null
+        }
+      ]
+    },
+    "native-final": {
+      "python": "3.12.10",
+      "platform": "Windows-11-10.0.26200-SP0",
+      "config": {
+        "envs": 128,
+        "rounds": 1000,
+        "seed": 42,
+        "repeats": 5,
+        "batch": true,
+        "fingerprint": false,
+        "greedy": 0.0,
+        "no_shaping": true,
+        "output": "experiments/native-final.json"
+      },
+      "runs": [
+        {
+          "seconds": 0.3498393000336364,
+          "decisions": 126539,
+          "decisions_per_second": 361706.0747258341,
+          "candidates": 410246,
+          "games": 1461,
+          "fingerprint": null
+        },
+        {
+          "seconds": 0.34890110010746866,
+          "decisions": 126539,
+          "decisions_per_second": 362678.70740740973,
+          "candidates": 410246,
+          "games": 1461,
+          "fingerprint": null
+        },
+        {
+          "seconds": 0.35097839997615665,
+          "decisions": 126539,
+          "decisions_per_second": 360532.1581288088,
+          "candidates": 410246,
+          "games": 1461,
+          "fingerprint": null
+        },
+        {
+          "seconds": 0.35669289994984865,
+          "decisions": 126539,
+          "decisions_per_second": 354756.1502283659,
+          "candidates": 410246,
+          "games": 1461,
+          "fingerprint": null
+        },
+        {
+          "seconds": 0.3459182999795303,
+          "decisions": 126539,
+          "decisions_per_second": 365806.0299425846,
+          "candidates": 410246,
+          "games": 1461,
+          "fingerprint": null
+        }
+      ]
+    },
+    "native-fingerprint-before": {
+      "python": "3.12.10",
+      "platform": "Windows-11-10.0.26200-SP0",
+      "config": {
+        "envs": 128,
+        "rounds": 1000,
+        "seed": 42,
+        "repeats": 1,
+        "batch": false,
+        "fingerprint": true,
+        "greedy": 0.0,
+        "no_shaping": false,
+        "output": "experiments/native-fingerprint-before.json"
+      },
+      "runs": [
+        {
+          "seconds": 1.0156509999651462,
+          "decisions": 126539,
+          "decisions_per_second": 124589.05667827079,
+          "candidates": 410246,
+          "games": 1461,
+          "fingerprint": "f605ff67c15d12603e0112b738d6f9fa992be3015c13df22ad0b25683c41eb8a"
+        }
+      ]
+    },
+    "native-fingerprint-final": {
+      "python": "3.12.10",
+      "platform": "Windows-11-10.0.26200-SP0",
+      "config": {
+        "envs": 128,
+        "rounds": 1000,
+        "seed": 42,
+        "repeats": 1,
+        "batch": true,
+        "fingerprint": true,
+        "greedy": 0.0,
+        "no_shaping": false,
+        "output": "experiments/native-fingerprint-final.json"
+      },
+      "runs": [
+        {
+          "seconds": 0.5063420000951737,
+          "decisions": 126539,
+          "decisions_per_second": 249908.16479023133,
+          "candidates": 410246,
+          "games": 1461,
+          "fingerprint": "f605ff67c15d12603e0112b738d6f9fa992be3015c13df22ad0b25683c41eb8a"
+        }
+      ]
+    },
+    "native-greedy-before": {
+      "python": "3.12.10",
+      "platform": "Windows-11-10.0.26200-SP0",
+      "config": {
+        "envs": 128,
+        "rounds": 300,
+        "seed": 42,
+        "repeats": 1,
+        "batch": false,
+        "fingerprint": true,
+        "greedy": 0.5,
+        "no_shaping": false,
+        "output": "experiments/native-greedy-before.json"
+      },
+      "runs": [
+        {
+          "seconds": 0.5736643000273034,
+          "decisions": 75464,
+          "decisions_per_second": 131547.31782404502,
+          "candidates": 136706,
+          "games": 876,
+          "fingerprint": "468505f4f257a17354f0114cecac9e9e40ed6c4e36dc4aa882a58873b29887de"
+        }
+      ]
+    },
+    "native-greedy-final": {
+      "python": "3.12.10",
+      "platform": "Windows-11-10.0.26200-SP0",
+      "config": {
+        "envs": 128,
+        "rounds": 300,
+        "seed": 42,
+        "repeats": 1,
+        "batch": true,
+        "fingerprint": true,
+        "greedy": 0.5,
+        "no_shaping": false,
+        "output": "experiments/native-greedy-final.json"
+      },
+      "runs": [
+        {
+          "seconds": 0.3673749000299722,
+          "decisions": 75464,
+          "decisions_per_second": 205414.14232121815,
+          "candidates": 136706,
+          "games": 876,
+          "fingerprint": "468505f4f257a17354f0114cecac9e9e40ed6c4e36dc4aa882a58873b29887de"
+        }
+      ]
+    },
+    "native-indexed-long": {
+      "python": "3.12.10",
+      "platform": "Windows-11-10.0.26200-SP0",
+      "config": {
+        "envs": 128,
+        "rounds": 10000,
+        "seed": 42,
+        "repeats": 3,
+        "batch": false,
+        "indexed": true,
+        "fingerprint": false,
+        "greedy": 0.0,
+        "no_shaping": true,
+        "output": "experiments/native-indexed-long.json"
+      },
+      "runs": [
+        {
+          "seconds": 3.2983423999976367,
+          "decisions": 1264782,
+          "decisions_per_second": 383459.8857901794,
+          "candidates": 4081753,
+          "games": 15218,
+          "fingerprint": null
+        },
+        {
+          "seconds": 3.5219662999734282,
+          "decisions": 1264782,
+          "decisions_per_second": 359112.465104945,
+          "candidates": 4081753,
+          "games": 15218,
+          "fingerprint": null
+        },
+        {
+          "seconds": 3.1787158000515774,
+          "decisions": 1264782,
+          "decisions_per_second": 397890.87152097013,
+          "candidates": 4081753,
+          "games": 15218,
+          "fingerprint": null
+        }
+      ]
+    },
+    "native-batch-final-long": {
+      "python": "3.12.10",
+      "platform": "Windows-11-10.0.26200-SP0",
+      "config": {
+        "envs": 128,
+        "rounds": 10000,
+        "seed": 42,
+        "repeats": 3,
+        "batch": true,
+        "indexed": false,
+        "prepare_only": false,
+        "fingerprint": false,
+        "greedy": 0.0,
+        "no_shaping": true,
+        "output": "experiments/native-batch-final-long.json"
+      },
+      "runs": [
+        {
+          "seconds": 3.4173092999262735,
+          "decisions": 1264782,
+          "decisions_per_second": 370110.48430040764,
+          "candidates": 4081753,
+          "games": 15218,
+          "fingerprint": null
+        },
+        {
+          "seconds": 3.4194701000815257,
+          "decisions": 1264782,
+          "decisions_per_second": 369876.6074807455,
+          "candidates": 4081753,
+          "games": 15218,
+          "fingerprint": null
+        },
+        {
+          "seconds": 3.4059099999722093,
+          "decisions": 1264782,
+          "decisions_per_second": 371349.21357590775,
+          "candidates": 4081753,
+          "games": 15218,
+          "fingerprint": null
+        }
+      ]
+    },
+    "native-fingerprint-indexed": {
+      "python": "3.12.10",
+      "platform": "Windows-11-10.0.26200-SP0",
+      "config": {
+        "envs": 128,
+        "rounds": 1000,
+        "seed": 42,
+        "repeats": 1,
+        "batch": false,
+        "indexed": true,
+        "prepare_only": false,
+        "fingerprint": true,
+        "greedy": 0.0,
+        "no_shaping": false,
+        "output": "experiments/native-fingerprint-indexed.json"
+      },
+      "runs": [
+        {
+          "seconds": 1.366431500064209,
+          "decisions": 126539,
+          "decisions_per_second": 92605.44710368129,
+          "candidates": 410246,
+          "games": 1461,
+          "fingerprint": "f605ff67c15d12603e0112b738d6f9fa992be3015c13df22ad0b25683c41eb8a"
+        }
+      ]
+    },
+    "native-greedy-indexed": {
+      "python": "3.12.10",
+      "platform": "Windows-11-10.0.26200-SP0",
+      "config": {
+        "envs": 128,
+        "rounds": 300,
+        "seed": 42,
+        "repeats": 1,
+        "batch": false,
+        "indexed": true,
+        "prepare_only": false,
+        "fingerprint": true,
+        "greedy": 0.5,
+        "no_shaping": false,
+        "output": "experiments/native-greedy-indexed.json"
+      },
+      "runs": [
+        {
+          "seconds": 0.7352536999387667,
+          "decisions": 75464,
+          "decisions_per_second": 102636.68174166928,
+          "candidates": 136706,
+          "games": 876,
+          "fingerprint": "468505f4f257a17354f0114cecac9e9e40ed6c4e36dc4aa882a58873b29887de"
+        }
+      ]
+    },
+    "native-prepare-indexed": {
+      "python": "3.12.10",
+      "platform": "Windows-11-10.0.26200-SP0",
+      "config": {
+        "envs": 128,
+        "rounds": 1000,
+        "seed": 42,
+        "repeats": 5,
+        "batch": false,
+        "indexed": false,
+        "prepare_only": true,
+        "fingerprint": false,
+        "greedy": 0.0,
+        "no_shaping": false,
+        "output": "experiments/native-prepare-indexed.json"
+      },
+      "preparation": {
+        "states": 128,
+        "candidates": 491,
+        "calls_per_sample": 1000,
+        "methods": {
+          "prepare_batch_with_metadata": {
+            "median_ms": 0.12731469993013889,
+            "samples_ms": [
+              0.12731469993013889,
+              0.12239719997160137,
+              0.124814199982211,
+              0.13898789999075234,
+              0.13008159992750734
+            ]
+          },
+          "prepare_indexed_batch": {
+            "median_ms": 0.08432030002586544,
+            "samples_ms": [
+              0.08169080002699047,
+              0.07763129996601492,
+              0.08537680003792048,
+              0.08798909990582615,
+              0.08432030002586544
+            ]
+          }
+        }
+      }
+    }
+  }
+}

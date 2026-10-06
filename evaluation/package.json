@@ -1,0 +1,8 @@
+{
+  "name": "rlcard-a3-evaluation",
+  "private": true,
+  "type": "module",
+  "scripts": { "evaluate": "tsx src/cli.ts", "check": "tsc --noEmit", "test": "tsx --test src/*.test.ts" },
+  "dependencies": { "onnxruntime-node": "1.24.3", "tsx": "4.21.0" },
+  "devDependencies": { "@types/node": "^22.0.0", "typescript": "5.9.3" }
+}

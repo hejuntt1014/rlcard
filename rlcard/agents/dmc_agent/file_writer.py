@@ -1,3 +1,5 @@
+# Modifications copyright (c) 2026 hejuntt1014.
+# Modified for batched training, optional backends, and runtime portability.
 # Copyright (c) Facebook, Inc. and its affiliates.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -33,7 +35,7 @@ def gather_metadata() -> Dict:
         git_sha = repo.commit().hexsha
         git_data = dict(
             commit=git_sha,
-            branch=repo.active_branch.name,
+            branch=None if repo.head.is_detached else repo.active_branch.name,
             is_dirty=repo.is_dirty(),
             path=repo.git_dir,
         )
@@ -54,7 +56,9 @@ def gather_metadata() -> Dict:
         successful=False,
         git=git_data,
         slurm=slurm_data,
-        env=os.environ.copy(),
+        env={key: os.environ[key] for key in (
+            'CUDA_VISIBLE_DEVICES', 'OMP_NUM_THREADS', 'MKL_NUM_THREADS')
+            if key in os.environ},
     )
 
 
@@ -81,7 +85,8 @@ class FileWriter:
         self.metadata['xpid'] = self.xpid
 
         formatter = logging.Formatter('%(message)s')
-        self._logger = logging.getLogger('palaas/out')
+        self._logger = logging.getLogger('rlcard.dmc.%s.%s' % (os.getpid(), id(self)))
+        self._logger.propagate = False
 
         # to stdout handler
         shandle = logging.StreamHandler()
@@ -181,6 +186,9 @@ class FileWriter:
             '%Y-%m-%d %H:%M:%S.%f')
         self.metadata['successful'] = successful
         self._save_metadata()
+        for handler in list(self._logger.handlers):
+            handler.close()
+            self._logger.removeHandler(handler)
 
     def _save_metadata(self) -> None:
         with open(self.paths['meta'], 'w') as jsonfile:
