@@ -5,6 +5,7 @@ import queue
 import tempfile
 import unittest
 from unittest.mock import patch
+from collections import deque
 
 import numpy as np
 import torch
@@ -12,7 +13,7 @@ import torch
 import rlcard
 from rlcard.agents.dmc_agent.collector import score_action_groups, choose_action_indices, PythonPool
 from rlcard.agents.dmc_agent.model import DMCModel
-from rlcard.agents.dmc_agent.trainer import DMCTrainer
+from rlcard.agents.dmc_agent.trainer import DMCTrainer, learn
 from rlcard.agents.dmc_agent.utils import create_buffers, TrajectoryWriter, BatchReader
 from rlcard.envs.a3dizhu.dmc import A3Adapter, NativePool
 
@@ -119,6 +120,58 @@ class TestContextPipeline(unittest.TestCase):
             model, _ = load_policy(trainer.checkpointpath, env)
             result = summarize(evaluate(model, env, [4], max_steps=1000))
             self.assertEqual(result['games'], 4)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), 'CUDA integration test')
+class TestContextCUDA(unittest.TestCase):
+    def test_precisions_declaration_and_mixed_batches(self):
+        torch.set_num_threads(1)
+        for precision in ('fp32', 'bf16', 'fp16'):
+            for mixed in (False, True):
+                with self.subTest(precision=precision, mixed=mixed):
+                    torch.manual_seed(42)
+                    model = DMCModel([[2668]], [[111]], [32], device='0', architecture='context',
+                                     aux_classes=(3,3,3,4,4))
+                    agent = model.get_agent(0)
+                    state = torch.rand(4, 2, 2668)
+                    state[..., 525] = 1
+                    if mixed:
+                        state[::2, :, 525] = 0
+                    action = torch.zeros(4, 2, 111)
+                    action[::2, :, :52] = 1
+                    batch = dict(state=state, action=action, target=torch.ones(4,2),
+                                 aux_target=torch.full((4,2,5), -1),
+                                 done=torch.ones(4,2,dtype=torch.bool), episode_return=torch.ones(4,2))
+                    optimizer = torch.optim.RMSprop(agent.parameters(), lr=1e-4)
+                    scaler = torch.amp.GradScaler('cuda') if precision == 'fp16' else None
+                    initial = agent.net.declare_head.weight.detach().clone()
+                    for _ in range(8):
+                        loss = learn(0, {}, agent, batch, optimizer, '0', 40, [deque()],
+                                     sync_weights=False, precision=precision, scaler=scaler)
+                        self.assertTrue(torch.isfinite(loss))
+                    self.assertFalse(torch.equal(initial, agent.net.declare_head.weight))
+                    self.assertTrue(all(torch.isfinite(p).all() for p in agent.parameters()))
+                    if not mixed:
+                        self.assertTrue(all(p.grad is None for p in agent.net.output_head.parameters()))
+
+    def test_low_precision_compact_scoring(self):
+        for history in ('mlp', 'transformer'):
+            for dtype in (torch.bfloat16, torch.float16):
+                with self.subTest(history=history, dtype=dtype):
+                    model = DMCModel([[2668]], [[111]], [32], device='0', architecture='context',
+                                     history_encoder=history, aux_classes=())
+                    model.eval()
+                    agent = model.get_agent(0)
+                    agent.inference_dtype = dtype
+                    obs = np.zeros((3, 2668), dtype=np.float32)
+                    obs[0,525] = 1
+                    actions = np.zeros((7,111), dtype=np.float32)
+                    actions[0,:52] = 1
+                    with torch.no_grad(), torch.autocast('cuda', dtype=dtype):
+                        reference = agent.forward(torch.as_tensor(np.repeat(obs,[2,1,4],axis=0),device='cuda'),
+                                                  torch.as_tensor(actions,device='cuda')).float().cpu().numpy()
+                    actual = score_action_groups(agent, obs, actions, [0,2,3,7], 3, contextlib.nullcontext())
+                    np.testing.assert_allclose(actual, reference, atol=.03, rtol=.03)
 
 
 if __name__ == '__main__':
