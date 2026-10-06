@@ -160,6 +160,9 @@ Throughput is separate from policy quality: evaluate checkpoints against fixed
 opponents with fixed deals, multiple seeds, and a fixed game-score definition.
 No universal speedup factor is asserted for the supported games.
 
+An [RTX 5060 A3 measurement](benchmarks/rtx5060.md) provides example settings,
+raw results, memory observations, and a Linux reproduction script.
+
 ## Validation
 
 ```bash
