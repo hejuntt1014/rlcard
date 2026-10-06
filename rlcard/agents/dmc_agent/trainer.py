@@ -271,13 +271,14 @@ class DMCTrainer:
         errors = ctx.Queue()
         buffers = create_buffers(self.T, self.num_buffers, self.state_shape, self.action_shape,
                                  self.device_iterator, len(self.aux_classes), self.storage_dtype)
-        models, locks, free, full = {}, {}, {}, {}
+        models, locks, free, full, versions = {}, {}, {}, {}, {}
         readers, counters = [], []
         for device in self.device_iterator:
-            models[device] = self.model_func(device)
+            models[device] = self.model_func('cpu')
             models[device].share_memory()
             models[device].eval()
             locks[device] = ctx.Lock()
+            versions[device] = ctx.Value('q', 0)
             free[device] = [ctx.Queue(maxsize=self.num_buffers) for _ in range(self.num_players)]
             full[device] = [ctx.Queue(maxsize=self.num_buffers) for _ in range(self.num_players)]
             for p in range(self.num_players):
@@ -286,8 +287,6 @@ class DMCTrainer:
                     free[device][p].put(i)
                 readers.append((device, p, BatchReader(free[device][p], full[device][p],
                                                        buffers[device][p], self.B)))
-            if device != 'cpu':
-                torch.cuda.synchronize(device)
         self.plogger = FileWriter(self.xpid, xp_args=dict(
             model=self._model_spec(), backend=self.backend, seed=self.seed,
             batch_size=self.B, unroll_length=self.T, envs_per_actor=self.envs_per_actor,
@@ -306,8 +305,7 @@ class DMCTrainer:
                 with locks[device]:
                     for p in ([0] if self.share_weights else range(self.num_players)):
                         model.get_agent(p).load_state_dict(learner.get_agent(p).state_dict())
-                    if device != 'cpu':
-                        torch.cuda.synchronize(device)
+                    versions[device].value += 1
 
         def checkpoint():
             payload = dict(model_state_dict=[a.state_dict() for a in learner.get_agents()],
@@ -332,7 +330,8 @@ class DMCTrainer:
                             args=(actor_id, actor_seed, self.env_source, models[device], locks[device],
                                   buffers[device], free[device], full[device], stop, exploration,
                                   errors, counter, self.T, self.envs_per_actor, self.backend,
-                                  self.adapter_class, self.max_inference_actions, self.max_episode_steps))
+                                  self.adapter_class, self.max_inference_actions, self.max_episode_steps,
+                                  device, versions[device]))
                         actor.start()
                         self.actor_processes.append(actor)
             while self.frames < self.total_frames:

@@ -1,5 +1,6 @@
 """Batched decision inference and interruptible rollout workers."""
 import copy
+import contextlib
 import random
 import traceback
 from collections import defaultdict
@@ -181,12 +182,25 @@ class PythonPool:
 
 def actor_worker(actor_id, seed, env, model, model_lock, buffers,
                  free_queues, full_queues, stop, epsilon, errors, counters,
-                 T, count, backend, adapter_class, max_actions, max_episode_steps):
+                 T, count, backend, adapter_class, max_actions, max_episode_steps,
+                 inference_device='cpu', policy_version=None):
     try:
         torch.set_num_threads(1)
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
+        shared_model = model
+        local_version = -1
+        inference_lock = model_lock
+        if inference_device != 'cpu':
+            # CUDA models belong to their worker. Only CPU snapshots cross processes.
+            with model_lock:
+                model = copy.deepcopy(shared_model)
+                local_version = policy_version.value
+            for agent in {id(a): a for a in model.get_agents()}.values():
+                agent.device = 'cuda:' + str(inference_device)
+                agent.net.to(agent.device)
+            inference_lock = contextlib.nullcontext()
         if backend == 'cpp':
             from rlcard.envs.a3dizhu.dmc import NativePool
             pool = NativePool(env() if callable(env) else env, count, seed, max_episode_steps)
@@ -194,11 +208,16 @@ def actor_worker(actor_id, seed, env, model, model_lock, buffers,
             pool = PythonPool(env, count, seed, adapter_class, max_episode_steps)
         writer = TrajectoryWriter(T, free_queues, full_queues, buffers)
         while not stop.is_set():
+            if inference_device != 'cpu' and policy_version.value != local_version:
+                with model_lock:
+                    for p in ([0] if model.shared else range(len(model.get_agents()))):
+                        model.get_agent(p).load_state_dict(shared_model.get_agent(p).state_dict())
+                    local_version = policy_version.value
             writer.flush()
             if writer.congested():
                 stop.wait(.005)
                 continue
-            episodes, steps = pool.round(model, epsilon.value, max_actions, model_lock)
+            episodes, steps = pool.round(model, epsilon.value, max_actions, inference_lock)
             for episode in episodes:
                 writer.add_episode(*episode)
             with counters.get_lock():

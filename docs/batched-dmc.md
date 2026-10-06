@@ -119,8 +119,10 @@ are not accepted by this adapter.
 Weight sharing is inappropriate for differently shaped roles such as the landlord
 and farmers in standard Dou Dizhu. Equal shapes alone do not establish game
 symmetry. `num_threads` is accepted by the trainer, but the learner uses one update
-loop. Actor inference and weight publication use a per-device lock to prevent
-partially copied policy snapshots.
+loop. Policy publication uses versioned CPU snapshots and per-device locks. GPU
+actors keep local CUDA models and refresh them from published snapshots, so CUDA
+tensors do not cross process boundaries. CPU actors read the shared policy under
+the same lock used for publication.
 
 Increase pool sizes while the learner lacks data, then measure again. More actors
 or larger batches are not guaranteed to improve throughput. Queue backpressure
