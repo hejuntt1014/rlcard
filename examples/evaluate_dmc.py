@@ -47,7 +47,7 @@ def load_policy(checkpoint, env, device='cpu'):
         if not legacy_v6:
             raise ValueError('Checkpoint feature schema does not match the evaluation environment')
     fields = ('state_shape', 'action_shape', 'mlp_layers', 'share_weights',
-              'architecture', 'aux_classes', 'history_encoder')
+              'architecture', 'aux_classes', 'history_encoder', 'history_steps')
     kwargs = {key: spec[key] for key in fields if key in spec}
     model = DMCModel(**kwargs, device=device, exp_epsilon=0.)
     states = payload.get('model_state_dict', [])

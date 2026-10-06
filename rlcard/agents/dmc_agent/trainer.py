@@ -142,7 +142,7 @@ class DMCTrainer:
                  weight_sync_interval=50, stats_interval=50,
                  max_inference_actions=4096, max_episode_steps=10000,
                  actor_timeout=120, adapter_class=None, env_factory=None, actor_on_cpu=False,
-                 history_encoder='mlp', precision='fp32'):
+                 history_encoder='mlp', precision='fp32', history_steps=24):
         positive = dict(batch_size=batch_size, unroll_length=unroll_length,
                         num_buffers=num_buffers, num_actors=num_actors,
                         num_actor_devices=num_actor_devices, envs_per_actor=envs_per_actor,
@@ -168,6 +168,8 @@ class DMCTrainer:
             raise ValueError('precision must be fp32, bf16 or fp16')
         if history_encoder not in ('mlp', 'transformer'):
             raise ValueError('history_encoder must be mlp or transformer')
+        if type(history_steps) is not int or not 1 <= history_steps <= 24:
+            raise ValueError('history_steps must be an integer from 1 through 24')
         if precision != 'fp32' and not cuda:
             raise ValueError('Mixed precision requires CUDA')
         self.env = env
@@ -206,12 +208,13 @@ class DMCTrainer:
         self.aux_classes = tuple(getattr(env, 'aux_classes', (3, 3, 3))) if (is_a3 if auxiliary is None else auxiliary) else ()
         self.aux_groups = (((0, 1, 2), .1), ((3,), .05), ((4,), .05)) if is_v12 and self.aux_classes else None
         self.history_encoder, self.precision = history_encoder, precision
+        self.history_steps = history_steps
         self.feature_schema = getattr(env, 'feature_schema', 'a3-v6-850-action52-v1' if is_a3 else None)
         self.reward_mode = getattr(env, 'reward_mode', 'shaped' if is_a3 else 'terminal')
         if self.architecture == 'context' and not is_v12:
             raise ValueError('Context architecture requires a3dizhu-v12 features')
-        if self.architecture != 'context' and history_encoder != 'mlp':
-            raise ValueError('history_encoder is only configurable for the context architecture')
+        if self.architecture != 'context' and (history_encoder != 'mlp' or history_steps != 24):
+            raise ValueError('History encoder/window is only configurable for the context architecture')
         if self.aux_classes and not is_a3:
             raise ValueError('Built-in auxiliary labels are only available for A3')
         self.mlp_layers = list(mlp_layers or ([768] * 5 if is_v12 else [512] * 5))
@@ -259,7 +262,7 @@ class DMCTrainer:
     def model_func(self, device):
         return DMCModel(self.state_shape, self.action_shape, self.mlp_layers,
                         self.initial_epsilon, str(device), self.share_weights,
-                        self.architecture, self.aux_classes, self.history_encoder)
+                        self.architecture, self.aux_classes, self.history_encoder, self.history_steps)
 
     def _get_epsilon(self, frames):
         fraction = min(frames / self.epsilon_decay_frames, 1.)
@@ -270,6 +273,7 @@ class DMCTrainer:
                     action_shape=self.action_shape, mlp_layers=self.mlp_layers,
                     architecture=self.architecture, aux_classes=list(self.aux_classes),
                     share_weights=self.share_weights, history_encoder=self.history_encoder,
+                    history_steps=self.history_steps,
                     feature_schema=self.feature_schema, env_name=getattr(self.env, 'name', 'pettingzoo'),
                     reward_mode=self.reward_mode, auxiliary_labels='decision-public-v1',
                     rules=getattr(self.env, 'rules', None))

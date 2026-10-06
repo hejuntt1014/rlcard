@@ -46,6 +46,7 @@ def train(args):
         weight_sync_interval=args.weight_sync_interval,
         actor_on_cpu=args.actor_on_cpu,
         history_encoder=args.history_encoder,
+        history_steps=args.history_steps,
         precision=args.precision,
         initial_epsilon=args.initial_epsilon,
         final_epsilon=args.final_epsilon,
@@ -131,6 +132,7 @@ if __name__ == '__main__':
     parser.add_argument('--auxiliary', action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument('--hidden_sizes', type=int, nargs='+')
     parser.add_argument('--history_encoder', choices=['mlp', 'transformer'], default='mlp')
+    parser.add_argument('--history_steps', type=int, default=24)
     parser.add_argument('--precision', choices=['fp32', 'bf16', 'fp16'], default='fp32')
     parser.add_argument('--initial_epsilon', type=float)
     parser.add_argument('--final_epsilon', type=float)

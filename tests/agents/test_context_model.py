@@ -1,6 +1,7 @@
 """State reuse, decision routing, and history masking for A3 context policies."""
 
 import copy
+import importlib.util
 import unittest
 from unittest.mock import patch
 
@@ -20,8 +21,9 @@ class TestContextDMCNet(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(17)
 
-    def model(self, encoder='mlp', aux_classes=(3, 3, 3, 4, 4)):
-        return ContextDMCNet([STATE_DIM], [111], [32, 32], encoder, aux_classes)
+    def model(self, encoder='mlp', aux_classes=(3, 3, 3, 4, 4), history_steps=24):
+        return ContextDMCNet([STATE_DIM], [111], [32, 32], encoder, aux_classes,
+                             history_steps=history_steps)
 
     def observations(self, count=3):
         observations = torch.zeros(count, STATE_DIM)
@@ -154,6 +156,86 @@ class TestContextDMCNet(unittest.TestCase):
         net = self.model()
         with self.assertRaisesRegex(ValueError, 'phase must be'):
             net.score_encoded(net.encode_state(self.observations(1)), torch.zeros(1, 111), phase='other')
+
+    def test_short_window_ignores_old_history_but_preserves_recent_order(self):
+        obs = self.observations(1)
+        history = obs[:, OBS_STATIC_DIM:].view(1, HISTORY_LEN, HIST_TOKEN_DIM)
+        history[:] = torch.randn_like(history)
+        history[..., 4] = 1
+        old_changed = obs.clone()
+        old_history = old_changed[:, OBS_STATIC_DIM:].view(1, HISTORY_LEN, HIST_TOKEN_DIM)
+        old_history[:, :8] = torch.randn_like(old_history[:, :8])
+        old_history[:, :8, 4] = 1
+        reordered = obs.clone()
+        reordered_history = reordered[:, OBS_STATIC_DIM:].view(1, HISTORY_LEN, HIST_TOKEN_DIM)
+        reordered_history[:, [8, 9]] = reordered_history[:, [9, 8]].clone()
+        for encoder in ('mlp', 'transformer'):
+            with self.subTest(encoder=encoder):
+                net = self.model(encoder, history_steps=16).eval()
+                baseline = net.encode_state(obs)[0]
+                torch.testing.assert_close(net.encode_state(old_changed)[0], baseline)
+                self.assertGreater((net.encode_state(reordered)[0] - baseline).abs().max().item(), 1e-5)
+
+    def test_short_window_handles_left_aligned_opening_history(self):
+        short = self.observations(1)
+        for encoder in ('mlp', 'transformer'):
+            with self.subTest(encoder=encoder):
+                net = self.model(encoder, history_steps=16).eval()
+                reordered = short.clone()
+                history = reordered[:, OBS_STATIC_DIM:].view(1, HISTORY_LEN, HIST_TOKEN_DIM)
+                history[:, [0, 1]] = history[:, [1, 0]].clone()
+                baseline = net.encode_state(short)[0]
+                self.assertGreater((net.encode_state(reordered)[0] - baseline).abs().max().item(), 1e-5)
+                dirty = short.clone()
+                padding = dirty[:, OBS_STATIC_DIM:].view(1, HISTORY_LEN, HIST_TOKEN_DIM)
+                padding[:, 3:] = float('nan')
+                padding[:, 3:, 4] = 0
+                torch.testing.assert_close(net.encode_state(dirty)[0], baseline)
+                empty = net.encode_state(torch.zeros(1, STATE_DIM))[0]
+                self.assertTrue(torch.isfinite(empty).all())
+
+    @unittest.skipUnless(importlib.util.find_spec('a3dizhu_v12_cpp'), 'Optional rich A3 extension')
+    def test_native_opening_decisions_retain_first_eight_events(self):
+        import a3dizhu_v12_cpp
+        engine = a3dizhu_v12_cpp.CppEngine()
+        engine.seed(42)
+        engine.set_greedy_ratio(1.)
+        engine.reset()
+        while engine.is_declaration_phase():
+            engine.step('pass')
+        models = {encoder: self.model(encoder, history_steps=16).eval()
+                  for encoder in ('mlp', 'transformer')}
+        for count in range(1, 9):
+            engine.step(engine.get_rule_agent_action())
+            obs = torch.as_tensor(engine.encode_obs(engine.get_player_id())).float().unsqueeze(0)
+            full_history = obs[:, OBS_STATIC_DIM:].view(1, HISTORY_LEN, HIST_TOKEN_DIM)
+            self.assertEqual(int(full_history[..., 4].sum()), count)
+            expected = full_history[:, :16]
+            for encoder, net in models.items():
+                with self.subTest(events=count, encoder=encoder):
+                    captured = []
+                    module = net.hist_encoder if encoder == 'mlp' else net.hist_token_proj
+                    hook = module.register_forward_pre_hook(
+                        lambda _module, args: captured.append(args[0].detach().clone()))
+                    try:
+                        net.encode_state(obs)
+                    finally:
+                        hook.remove()
+                    torch.testing.assert_close(captured[0].reshape_as(expected), expected)
+                    self.assertEqual(int(captured[0].reshape_as(expected)[..., 4].sum()), count)
+
+    def test_history_window_parameter_counts_and_validation(self):
+        for encoder, reduction in (('mlp', 8 * HIST_TOKEN_DIM * 256), ('transformer', 8 * 256)):
+            with self.subTest(encoder=encoder):
+                full = self.model(encoder)
+                short = self.model(encoder, history_steps=16)
+                self.assertEqual(full.history_steps, 24)
+                self.assertEqual(short.history_steps, 16)
+                self.assertEqual(sum(p.numel() for p in full.parameters()) -
+                                 sum(p.numel() for p in short.parameters()), reduction)
+        for invalid in (0, 25, -1, True, 16.0, '16', None):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, 'history_steps'):
+                self.model(history_steps=invalid)
 
 
 if __name__ == '__main__':

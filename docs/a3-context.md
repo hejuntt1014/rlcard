@@ -24,6 +24,12 @@ masked, and each label is captured at its decision state. These auxiliary tasks
 reconstruct public information; their presence does not establish hidden-card
 inference ability or improved playing strength.
 
+`--history_steps 16` uses the most recent 16 valid records and has 6,023,956
+parameters (about 22.98 MiB). The environment still supplies the same 24-record
+feature protocol. Early games retain their available records; trailing padding is
+not mistaken for recent history. The default window remains 24 for a baseline,
+and the checkpoint records the selected window. Changing it requires a new model.
+
 Candidate groups carry one observation per decision, a flat action array and
 offsets. Each state is encoded once, and its context is reused across candidate
 actions. Declaration candidates use only the declaration head. Forced and
@@ -103,6 +109,10 @@ opponent pool for that conclusion.
 ```bash
 python -m examples.benchmark_context --device 0 --envs 128 --repeats 20
 ```
+
+Repeat with `--history_steps 16` to compare the shorter window on the same seeded
+decisions. Window length must also be compared by paired game scores; inference
+speed alone does not identify the stronger policy.
 
 The benchmark obtains real legal decisions, verifies expanded and compact
 forward outputs agree, and times both paths using the same network weights.

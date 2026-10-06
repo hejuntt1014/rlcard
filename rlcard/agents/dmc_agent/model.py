@@ -122,12 +122,14 @@ class DMCAgent:
         architecture='mlp',
         aux_classes=(),
         history_encoder='mlp',
+        history_steps=24,
     ):
         self.use_raw = False
         self.device = 'cuda:' + device if device != "cpu" else "cpu"
         if architecture == 'context':
             from .context_model import ContextDMCNet
-            self.net = ContextDMCNet(state_shape, action_shape, mlp_layers, history_encoder, aux_classes).to(self.device)
+            self.net = ContextDMCNet(state_shape, action_shape, mlp_layers, history_encoder, aux_classes,
+                                     history_steps=history_steps).to(self.device)
         else:
             self.net = DMCNet(state_shape, action_shape, mlp_layers, architecture, aux_classes).to(self.device)
         self.exp_epsilon = exp_epsilon
@@ -198,6 +200,7 @@ class DMCModel:
         architecture='mlp',
         aux_classes=(),
         history_encoder='mlp',
+        history_steps=24,
     ):
         self.shared = share_weights
         num_players = len(state_shape)
@@ -211,6 +214,7 @@ class DMCModel:
                 mlp_layers, exp_epsilon, str(device),
                 architecture, aux_classes,
                 history_encoder,
+                history_steps,
             )
             self.agents = [agent for _ in range(num_players)]
         else:
@@ -221,6 +225,7 @@ class DMCModel:
                     mlp_layers, exp_epsilon, str(device),
                     architecture, aux_classes,
                     history_encoder,
+                    history_steps,
                 ))
 
     def share_memory(self):

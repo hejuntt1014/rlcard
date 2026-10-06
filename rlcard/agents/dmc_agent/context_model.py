@@ -47,7 +47,8 @@ class ContextDMCNet(nn.Module):
 
     def __init__(self, state_shape, action_shape,
                  mlp_layers=(768, 768, 768, 768, 768),
-                 history_encoder='mlp', aux_classes=(3, 3, 3, 4, 4)):
+                 history_encoder='mlp', aux_classes=(3, 3, 3, 4, 4),
+                 history_steps=24):
         super().__init__()
         if math.prod(state_shape) != STATE_DIM or math.prod(action_shape) != ACTION_DIM:
             raise ValueError('ContextDMCNet requires A3 state/action shapes 2668/111')
@@ -57,9 +58,12 @@ class ContextDMCNet(nn.Module):
             raise ValueError('Residual block widths must be identical')
         if history_encoder not in ('mlp', 'transformer'):
             raise ValueError('history_encoder must be mlp or transformer')
+        if type(history_steps) is not int or not 1 <= history_steps <= HISTORY_LEN:
+            raise ValueError('history_steps must be an integer between 1 and 24')
         if any(count <= 0 for count in aux_classes):
             raise ValueError('Auxiliary class counts must be positive')
         self.history_encoder = history_encoder
+        self.history_steps = history_steps
         self.aux_classes = tuple(aux_classes)
         hidden = mlp_layers[0]
         self.obs_static_proj = nn.Sequential(
@@ -67,12 +71,12 @@ class ContextDMCNet(nn.Module):
         )
         if history_encoder == 'mlp':
             self.hist_encoder = nn.Sequential(
-                nn.Linear(HISTORY_LEN * HIST_TOKEN_DIM, 256),
+                nn.Linear(history_steps * HIST_TOKEN_DIM, 256),
                 nn.LayerNorm(256), nn.ReLU(),
             )
         else:
             self.hist_token_proj = nn.Linear(HIST_TOKEN_DIM, 256)
-            self.hist_pos_embed = nn.Parameter(torch.empty(1, HISTORY_LEN, 256))
+            self.hist_pos_embed = nn.Parameter(torch.empty(1, history_steps, 256))
             nn.init.normal_(self.hist_pos_embed, std=0.02)
             layer = nn.TransformerEncoderLayer(
                 d_model=256, nhead=8, dim_feedforward=512, dropout=0.0,
@@ -104,6 +108,16 @@ class ContextDMCNet(nn.Module):
         static = obs[:, :OBS_STATIC_DIM]
         tokens = obs[:, OBS_STATIC_DIM:].reshape(-1, HISTORY_LEN, HIST_TOKEN_DIM)
         valid = tokens[..., 4] > 0.5
+        if self.history_steps != HISTORY_LEN:
+            # The native schema left-aligns valid history, padding its tail.
+            # Select relative to the last valid token, not the padded buffer end,
+            # so opening decisions retain their short histories as well.
+            positions = torch.arange(HISTORY_LEN, device=tokens.device)
+            last = torch.where(valid, positions + 1, 0).amax(dim=1)
+            start = (last - self.history_steps).clamp_min(0)
+            window = start[:, None] + positions[:self.history_steps]
+            tokens = tokens.gather(1, window.unsqueeze(-1).expand(-1, -1, HIST_TOKEN_DIM))
+            valid = valid.gather(1, window)
         # Invalid slots must not contribute, even if a caller leaves stale data.
         tokens = torch.where(valid.unsqueeze(-1), tokens, torch.zeros_like(tokens))
         if self.history_encoder == 'mlp':

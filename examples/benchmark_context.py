@@ -58,6 +58,7 @@ def main():
     parser.add_argument('--envs', type=int, default=32)
     parser.add_argument('--repeats', type=int, default=10)
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--history_steps', type=int, default=24)
     parser.add_argument('--output', default='experiments/context-benchmark.json')
     args = parser.parse_args()
     if args.envs < 1 or args.repeats < 1:
@@ -69,12 +70,14 @@ def main():
                   gpu=torch.cuda.get_device_name(int(args.device)) if args.device != 'cpu' else None,
                   seed=args.seed, states=len(obs), candidates=len(actions),
                   unique_state_bytes=obs.nbytes, expanded_state_bytes=int(counts.sum()) * obs.shape[1],
-                  precision='fp32', method='identical real states, warmup, synchronized wall time, no training',
+                  precision='fp32', history_steps=args.history_steps,
+                  method='identical real states, warmup, synchronized wall time, no training',
                   models={})
     for history in ('mlp', 'transformer'):
         torch.manual_seed(args.seed)
         agent = DMCAgent([2668], [111], [768] * 5, device=args.device,
-                         architecture='context', history_encoder=history, aux_classes=(3,3,3,4,4))
+                         architecture='context', history_encoder=history, aux_classes=(3,3,3,4,4),
+                         history_steps=args.history_steps)
         agent.eval()
         def expanded():
             return score_actions(agent, np.repeat(obs, counts, axis=0), actions, 4096, contextlib.nullcontext())
