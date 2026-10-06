@@ -66,8 +66,10 @@ def main():
     initial_trainer=DMCTrainer(rlcard.make('a3dizhu-v12',config={'reward_mode':'game','seed':args.seed}),
         cuda='',share_weights=True,history_steps=24,total_frames=args.frames,seed=args.seed)
     initial=initial_trainer.model_func('cpu')
+    initial_path=directory/'initial_policy.tmp'
     torch.save(dict(model_spec=initial_trainer._model_spec(),frames=0,share_weights=True,
-                    model_state_dict=[a.state_dict() for a in initial.get_agents()]),directory/'initial_policy.tar')
+                    model_state_dict=[a.state_dict() for a in initial.get_agents()]),initial_path)
+    os.replace(initial_path,directory/'initial_policy.tar')
     del initial,initial_trainer
     process=None; interrupted=False
     def stop(signum,frame):
