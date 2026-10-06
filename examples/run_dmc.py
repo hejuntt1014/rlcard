@@ -11,7 +11,10 @@ from rlcard.agents.dmc_agent import DMCTrainer
 def train(args):
 
     # Make the environment
-    env = rlcard.make(args.env)
+    config = {'seed': args.seed}
+    if args.env == 'a3dizhu':
+        config['backend'] = args.backend
+    env = rlcard.make(args.env, config=config)
 
     # Initialize the DMC trainer
     trainer = DMCTrainer(
@@ -24,6 +27,18 @@ def train(args):
         num_actor_devices=args.num_actor_devices,
         num_actors=args.num_actors,
         training_device=args.training_device,
+        total_frames=args.total_frames,
+        batch_size=args.batch_size,
+        unroll_length=args.unroll_length,
+        num_buffers=args.num_buffers,
+        envs_per_actor=args.envs_per_actor,
+        backend=args.backend,
+        seed=args.seed,
+        share_weights=args.share_weights,
+        architecture=args.architecture,
+        auxiliary=args.auxiliary,
+        mlp_layers=args.hidden_sizes,
+        weight_sync_interval=args.weight_sync_interval,
     )
 
     # Train DMC Agents
@@ -43,7 +58,8 @@ if __name__ == '__main__':
             'mahjong',
             'no-limit-holdem',
             'uno',
-            'gin-rummy'
+            'gin-rummy',
+            'a3dizhu'
         ],
     )
     parser.add_argument(
@@ -91,8 +107,21 @@ if __name__ == '__main__':
         help='The index of the GPU used for training models',
     )
 
+    parser.add_argument('--total_frames', type=int, default=1000000)
+    parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--unroll_length', type=int, default=60)
+    parser.add_argument('--num_buffers', type=int, default=64)
+    parser.add_argument('--envs_per_actor', type=int, default=8)
+    parser.add_argument('--backend', choices=['auto', 'python', 'cpp'], default='auto')
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--share_weights', action='store_true')
+    parser.add_argument('--architecture', choices=['mlp', 'resnet'])
+    parser.add_argument('--auxiliary', action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument('--hidden_sizes', type=int, nargs='+', default=[512] * 5)
+    parser.add_argument('--weight_sync_interval', type=int, default=50)
+    parser.add_argument('--cpu_threads', type=int, default=1)
     args = parser.parse_args()
+    torch.set_num_threads(args.cpu_threads)
 
     os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda
     train(args)
-

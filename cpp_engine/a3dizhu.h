@@ -264,6 +264,7 @@ public:
     struct RuleStepData {
         int player_id;
         int8_t obs[STATE_DIM];
+        int8_t action[ACTION_DIM];
     };
 
     struct BatchData {

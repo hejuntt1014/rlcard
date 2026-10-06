@@ -2,7 +2,7 @@
 A3 地主 RLCard 环境接口
 
 支持两种后端:
-  - C++ 加速后端 (a3dizhu_cpp.CppEngine) — 默认，性能 10-30x
+  - C++ 后端 (a3dizhu_cpp.CppEngine) — 安装扩展后默认使用
   - 纯 Python 后端 (Game) — 自动回退
 
 状态特征编码（STATE_DIM = 850 维）：
@@ -156,7 +156,7 @@ class A3DizhuCppEnv:
             if self._engine.is_rule_agent_seat(player_id):
                 action_key = self._engine.get_rule_agent_action()
                 self._engine.step(action_key)
-                trajectories[player_id].append('pass')
+                trajectories[player_id].append(action_key)
             else:
                 if is_training:
                     action = self.agents[player_id].step(state)
@@ -292,11 +292,6 @@ class A3DizhuPyEnv(Env):
         return self._extract_state(next_state), next_player_id
 
     def run(self, is_training=False):
-        if not self._seat_agents:
-            trajectories, _ = super().run(is_training=is_training)
-            payoffs = self.get_training_payoffs() if is_training else self.get_payoffs()
-            step_rewards = [list(sr) for sr in self._step_rewards]
-            return trajectories, payoffs, step_rewards
         trajectories = [[] for _ in range(self.num_players)]
         state, player_id = self.reset()
         trajectories[player_id].append(state)
@@ -305,7 +300,7 @@ class A3DizhuPyEnv(Env):
                 raw_state = state.get('raw_obs', state)
                 action = self._seat_agents[player_id].step(raw_state)
                 next_state, next_player_id = self.step(action, raw_action=True)
-                trajectories[player_id].append('pass')
+                trajectories[player_id].append(action if isinstance(action, str) else _hand_key(action))
             else:
                 if not is_training:
                     action, _ = self.agents[player_id].eval_step(state)
@@ -477,7 +472,12 @@ class A3DizhuPyEnv(Env):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def A3DizhuEnv(config):
-    """工厂函数：优先使用 C++ 加速版，不可用时回退到纯 Python 版"""
-    if _HAS_CPP:
+    """Create an A3 environment with an optional native backend."""
+    backend = config.get('backend', 'auto')
+    if backend not in ('auto', 'python', 'cpp'):
+        raise ValueError('backend must be auto, python or cpp')
+    if backend == 'cpp' and not _HAS_CPP:
+        raise ImportError('Build a3dizhu_cpp with python setup_cpp.py build_ext --inplace')
+    if _HAS_CPP and backend != 'python':
         return A3DizhuCppEnv(config)
     return A3DizhuPyEnv(config)

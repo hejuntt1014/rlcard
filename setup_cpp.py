@@ -14,6 +14,7 @@ will be placed in the current directory and can be imported directly.
 """
 
 import os
+import sys
 from setuptools import setup, Extension
 
 try:
@@ -33,6 +34,7 @@ ext_modules = [
         include_dirs=[cpp_dir],
         cxx_std=17,
         define_macros=[("NDEBUG", "1")],
+        extra_compile_args=['/utf-8'] if sys.platform == 'win32' else [],
     ),
 ]
 

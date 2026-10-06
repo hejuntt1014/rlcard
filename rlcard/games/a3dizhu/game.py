@@ -693,7 +693,8 @@ class Game:
         )
         self._history = []
 
-        return self.get_state(start_player), start_player
+        player_id = self.get_player_id()
+        return self.get_state(player_id), player_id
 
     def step(self, action):
         """执行一步动作。

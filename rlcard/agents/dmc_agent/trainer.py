@@ -13,540 +13,405 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""DMC training with per-role batching and optional native environment backends."""
 import contextlib
-import os
-import threading
-import time
-import timeit
-import pprint
+import importlib.util
 import math
+import os
+import time
 from collections import deque
+from queue import Empty
 
+import numpy as np
 import torch
 from torch import multiprocessing as mp
 from torch import nn
-
-from .file_writer import FileWriter
-from .model import DMCModel
-from .pettingzoo_model import DMCModelPettingZoo
-from .utils import (
-    get_batch,
-    get_batch_nonblocking,
-    create_buffers,
-    create_optimizers,
-    act,
-    act_vectorized,
-    log,
-)
-from .pettingzoo_utils import (
-    create_buffers_pettingzoo,
-    act_pettingzoo,
-)
-
 import torch.nn.functional as F
 
-AUX_LOSS_WEIGHT = 0.1
+from .collector import RLCardAdapter, PettingZooAdapter, actor_worker, environment_source
+from .file_writer import FileWriter
+from .model import DMCModel
+from .utils import BatchReader, create_buffers, create_optimizers, log
+
 
 def compute_loss(logits, targets):
-    loss = ((logits - targets)**2).mean()
-    return loss
+    return ((logits - targets) ** 2).mean()
 
-def learn(
-    position,
-    actor_models,
-    agent,
-    batch,
-    optimizer,
-    training_device,
-    max_grad_norm,
-    mean_episode_return_buf,
-    lock=None,
-    sync_weights=True,
-):
-    """Performs a learning (optimization) step."""
-    device = "cuda:"+str(training_device) if training_device != "cpu" else "cpu"
-    state = torch.flatten(batch['state'].to(device), 0, 1).float()
-    action = torch.flatten(batch['action'].to(device), 0, 1).float()
-    target = torch.flatten(batch['target'].to(device), 0, 1)
-    aux_target = torch.flatten(batch['aux_target'].to(device), 0, 1).long()
-    episode_returns = batch['episode_return'][batch['done']]
-    mean_episode_return_buf[position].append(torch.mean(episode_returns).to(device))
 
-    ctx = lock if lock is not None else contextlib.nullcontext()
-    with ctx:
-        values, aux_logits = agent.forward_with_aux(state, action)
-        q_loss = compute_loss(values, target)
+class FrameScheduler:
+    """Cosine learning rate as a function of consumed training samples."""
+    def __init__(self, optimizer, learning_rate, min_lr, total_frames, batch_frames):
+        self.optimizer = optimizer
+        self.learning_rate, self.min_lr = learning_rate, min_lr
+        self.total_frames, self.batch_frames = total_frames, batch_frames
+        self.frames = self.last_epoch = 0
 
-        aux_loss = torch.tensor(0.0, device=device)
-        aux_count = 0
-        for i in range(3):
-            mask = aux_target[:, i] >= 0
-            if mask.any():
-                aux_loss += F.cross_entropy(
-                    aux_logits[:, i*3:(i+1)*3][mask],
-                    aux_target[:, i][mask],
-                )
-                aux_count += 1
-        if aux_count > 0:
-            aux_loss = aux_loss / aux_count
+    def step(self, frames):
+        self.frames = frames
+        self.last_epoch = frames // self.batch_frames
+        progress = min(frames / self.total_frames, 1.)
+        rate = self.min_lr + .5 * (self.learning_rate - self.min_lr) * (1 + math.cos(math.pi * progress))
+        for group in self.optimizer.param_groups:
+            group['lr'] = rate
 
-        loss = q_loss + AUX_LOSS_WEIGHT * aux_loss
+    def state_dict(self):
+        return dict(frames=self.frames, last_epoch=self.last_epoch)
 
-        optimizer.zero_grad()
+    def load_state_dict(self, state):
+        self.step(state['frames'])
+
+
+def auxiliary_loss(logits, labels, classes):
+    """Masked categorical tasks without host-side tests on CUDA tensors."""
+    offset = 0
+    losses, active = [], []
+    for i, width in enumerate(classes):
+        valid = labels[:, i] >= 0
+        safe_labels = labels[:, i].clamp(min=0)
+        loss = F.cross_entropy(logits[:, offset:offset + width], safe_labels, reduction='none')
+        count = valid.sum()
+        losses.append((loss * valid).sum() / count.clamp(min=1))
+        active.append(count > 0)
+        offset += width
+    return torch.stack(losses).sum() / torch.stack(active).sum().clamp(min=1)
+
+
+def learn(position, actor_models, agent, batch, optimizer, training_device,
+          max_grad_norm, mean_episode_return_buf, lock=None, sync_weights=True,
+          aux_weight=.1):
+    device = 'cuda:' + str(training_device) if training_device != 'cpu' else 'cpu'
+    state = batch['state'].to(device).flatten(0, 1).float()
+    action = batch['action'].to(device).flatten(0, 1).float()
+    target = batch['target'].to(device).flatten(0, 1)
+    returns = batch['episode_return'][batch['done']]
+    if returns.numel():
+        mean_episode_return_buf[position].append(float(returns.mean()))
+    with lock if lock is not None else contextlib.nullcontext():
+        values, aux = agent.forward_with_aux(state, action)
+        loss = compute_loss(values, target)
+        if aux is not None and 'aux_target' in batch:
+            labels = batch['aux_target'].to(device).flatten(0, 1).long()
+            loss = loss + aux_weight * auxiliary_loss(aux, labels, agent.net.aux_classes)
+        optimizer.zero_grad(set_to_none=True)
         loss.backward()
         nn.utils.clip_grad_norm_(agent.parameters(), max_grad_norm)
         optimizer.step()
-
         if sync_weights:
-            for actor_model in actor_models.values():
-                actor_model.get_agent(position).load_state_dict(agent.state_dict())
-        return loss.detach()
+            for model in actor_models.values():
+                model.get_agent(position).load_state_dict(agent.state_dict())
+    return loss.detach()
 
 
 class DMCTrainer:
-    """Deep Monte-Carlo Trainer（A3 地主增强版）
+    """Batched DMC for RLCard and PettingZoo AEC environments.
 
-    相对原版 RLCard DMC 的改进：
-      - 权重共享: 4 个位置共用 1 个网络（share_weights=True）
-      - Epsilon 退火: 探索率从 initial_epsilon 线性衰减到 final_epsilon
-      - 学习率调度: Cosine Annealing 到 min_lr
-      - 残差网络: DMCNet 使用 ResBlock + LayerNorm
+    Independent role policies are the default. Weight sharing is opt-in and
+    requires equal shapes and compatible role semantics. `backend='auto'` uses
+    native A3 batching when available and otherwise uses Python environments.
+    `vectorized=False` selects one environment per actor.
     """
-    def __init__(
-        self,
-        env,
-        cuda="",
-        is_pettingzoo_env=False,
-        load_model=False,
-        xpid='dmc',
-        save_interval=30,
-        num_actor_devices=1,
-        num_actors=5,
-        training_device="0",
-        savedir='experiments/dmc_result',
-        total_frames=100000000000,
-        exp_epsilon=0.01,
-        batch_size=32,
-        unroll_length=100,
-        num_buffers=50,
-        num_threads=4,
-        max_grad_norm=40,
-        learning_rate=0.0001,
-        alpha=0.99,
-        momentum=0,
-        epsilon=0.00001,
-        # ─── 新增参数 ─────────────────────────
-        share_weights=True,
-        initial_epsilon=0.1,
-        final_epsilon=0.01,
-        epsilon_decay_ratio=0.8,
-        min_lr=1e-6,
-        # ─── 向量化 Actor ─────────────────────
-        vectorized=True,
-        envs_per_actor=200,
-    ):
+    def __init__(self, env, cuda='', is_pettingzoo_env=False, load_model=False,
+                 xpid='dmc', save_interval=30, num_actor_devices=1, num_actors=5,
+                 training_device='0', savedir='experiments/dmc_result',
+                 total_frames=100000000000, exp_epsilon=.01, batch_size=32,
+                 unroll_length=100, num_buffers=50, num_threads=4,
+                 max_grad_norm=40, learning_rate=.0001, alpha=.99, momentum=0,
+                 epsilon=.00001, share_weights=False, initial_epsilon=None,
+                 final_epsilon=None, epsilon_decay_ratio=.8, min_lr=1e-6,
+                 vectorized=True, envs_per_actor=8, backend='auto', seed=0,
+                 architecture=None, mlp_layers=None, auxiliary=None,
+                 weight_sync_interval=50, stats_interval=50,
+                 max_inference_actions=4096, max_episode_steps=10000,
+                 actor_timeout=120, adapter_class=None, env_factory=None):
+        positive = dict(batch_size=batch_size, unroll_length=unroll_length,
+                        num_buffers=num_buffers, num_actors=num_actors,
+                        num_actor_devices=num_actor_devices, envs_per_actor=envs_per_actor,
+                        weight_sync_interval=weight_sync_interval, stats_interval=stats_interval,
+                        max_inference_actions=max_inference_actions, max_episode_steps=max_episode_steps)
+        if any(not isinstance(v, int) or v <= 0 for v in positive.values()):
+            raise ValueError('Counts must be positive integers: ' + str(positive))
+        if num_buffers < batch_size:
+            raise ValueError('num_buffers must be >= batch_size')
+        if total_frames <= 0 or actor_timeout <= 0 or save_interval <= 0:
+            raise ValueError('total_frames, actor_timeout and save_interval must be positive')
+        if not 0 <= seed < 2**32 or not 0 < epsilon_decay_ratio <= 1:
+            raise ValueError('Invalid seed or epsilon_decay_ratio')
+        initial_epsilon = exp_epsilon if initial_epsilon is None else initial_epsilon
+        final_epsilon = initial_epsilon if final_epsilon is None else final_epsilon
+        if not (0 <= initial_epsilon <= 1 and 0 <= final_epsilon <= 1):
+            raise ValueError('Exploration probabilities must be in [0, 1]')
+        if not 0 <= min_lr <= learning_rate or learning_rate <= 0:
+            raise ValueError('Require 0 <= min_lr <= learning_rate and learning_rate > 0')
+        if backend not in ('auto', 'python', 'cpp'):
+            raise ValueError('backend must be auto, python or cpp')
         self.env = env
-
-        self.plogger = FileWriter(
-            xpid=xpid,
-            rootdir=savedir,
-        )
-
-        self.checkpointpath = os.path.expandvars(
-            os.path.expanduser('%s/%s/%s' % (savedir, xpid, 'model.tar')))
-
-        self.T = unroll_length
-        self.B = batch_size
-
-        self.xpid = xpid
-        self.load_model = load_model
-        self.savedir = savedir
-        self.save_interval = save_interval
-        self.num_actor_devices = num_actor_devices
-        self.num_actors = num_actors
-        self.training_device = training_device
-        self.total_frames = total_frames
-        self.exp_epsilon = exp_epsilon
-        self.num_buffers = num_buffers
-        self.num_threads = num_threads
-        self.max_grad_norm = max_grad_norm
-        self.learning_rate = learning_rate
-        self.alpha = alpha
-        self.momentum = momentum
-        self.epsilon = epsilon
-
-        self.share_weights = share_weights
-        self.initial_epsilon = initial_epsilon
-        self.final_epsilon = final_epsilon
-        self.epsilon_decay_frames = int(total_frames * epsilon_decay_ratio)
-        self.min_lr = min_lr
-
-        self.vectorized = vectorized
-        self.envs_per_actor = envs_per_actor
-        self.env_config = {
-            'greedy_ratio': getattr(env, 'greedy_ratio', 0.0),
-            'random_ratio': getattr(env, 'random_ratio', 0.0),
-        }
-
+        self.env_source = env_factory or environment_source(env)
         self.is_pettingzoo_env = is_pettingzoo_env
-        if not self.is_pettingzoo_env:
-            self.num_players = self.env.num_players
-            self.action_shape = self.env.action_shape
-            if self.action_shape[0] == None:
-                self.action_shape = [[self.env.num_actions] for _ in range(self.num_players)]
-
-            def model_func(device):
-                return DMCModel(
-                    self.env.state_shape,
-                    self.action_shape,
-                    exp_epsilon=self.initial_epsilon,
-                    device=str(device),
-                    share_weights=self.share_weights,
-                )
+        is_a3 = not is_pettingzoo_env and getattr(env, 'name', '') == 'a3dizhu'
+        if is_pettingzoo_env:
+            env.reset(seed=seed)
+            self.num_players = len(env.possible_agents)
+            self.state_shape = [list(env.observation_space(p)['observation'].shape)
+                                for p in env.possible_agents]
+            self.action_shape = [[env.action_space(p).n] for p in env.possible_agents]
+            default_adapter = PettingZooAdapter
         else:
-            self.num_players = self.env.num_agents
-
-            def model_func(device):
-                return DMCModelPettingZoo(
-                    self.env,
-                    exp_epsilon=self.initial_epsilon,
-                    device=device
-                )
-        self.model_func = model_func
-
+            self.num_players = env.num_players
+            self.state_shape = env.state_shape
+            self.action_shape = [list(s) if s is not None else [env.num_actions]
+                                 for s in env.action_shape]
+            default_adapter = RLCardAdapter
+            if is_a3:
+                from rlcard.envs.a3dizhu.dmc import A3Adapter
+                default_adapter = A3Adapter
+        self.adapter_class = adapter_class or default_adapter
+        self.state_shape = [[int(n) for n in s] for s in self.state_shape]
+        self.action_shape = [[int(n) for n in s] for s in self.action_shape]
+        native = False
+        if is_a3 and importlib.util.find_spec('a3dizhu_cpp') is not None:
+            from a3dizhu_cpp import VectorizedEngine
+            native = hasattr(VectorizedEngine, 'advance_to_decision_with_actions')
+        if backend == 'cpp' and (not native or adapter_class is not None):
+            raise ValueError('Native A3 backend unavailable: build the current C++ extension')
+        self.backend = ('cpp' if native and adapter_class is None else 'python') if backend == 'auto' else backend
+        self.architecture = architecture or ('resnet' if is_a3 else 'mlp')
+        self.aux_classes = (3, 3, 3) if (is_a3 if auxiliary is None else auxiliary) else ()
+        if self.aux_classes and not is_a3:
+            raise ValueError('Built-in auxiliary labels are only available for A3')
+        self.mlp_layers = list(mlp_layers or [512] * 5)
+        self.share_weights = share_weights
+        if share_weights and (any(tuple(s) != tuple(self.state_shape[0]) for s in self.state_shape)
+                              or any(tuple(s) != tuple(self.action_shape[0]) for s in self.action_shape)):
+            raise ValueError('Shared policies require identical observation and action shapes')
+        if self.architecture == 'mlp' and self.aux_classes:
+            raise ValueError('Use auxiliary=False with an MLP')
+        if cuda:
+            os.environ['CUDA_VISIBLE_DEVICES'] = cuda
+            if not torch.cuda.is_available():
+                raise ValueError('CUDA requested but unavailable')
+            if num_actor_devices > torch.cuda.device_count():
+                raise ValueError('num_actor_devices exceeds visible CUDA devices')
+            if training_device != 'cpu' and not 0 <= int(training_device) < torch.cuda.device_count():
+                raise ValueError('training_device is not a visible CUDA device')
+            self.device_iterator = list(range(num_actor_devices))
+            self.training_device = str(training_device)
+        else:
+            self.device_iterator = ['cpu']
+            self.training_device = 'cpu'
+        self.T, self.B = unroll_length, batch_size
+        self.num_buffers, self.num_actors = num_buffers, num_actors
+        self.envs_per_actor = envs_per_actor if vectorized else 1
+        self.total_frames, self.seed = total_frames, seed
+        self.initial_epsilon, self.final_epsilon = initial_epsilon, final_epsilon
+        self.epsilon_decay_frames = max(1, int(total_frames * epsilon_decay_ratio))
+        self.learning_rate, self.min_lr = learning_rate, min_lr
+        self.alpha, self.momentum, self.epsilon = alpha, momentum, epsilon
+        self.max_grad_norm = max_grad_norm
+        self.weight_sync_interval, self.stats_interval = weight_sync_interval, stats_interval
+        self.max_inference_actions, self.max_episode_steps = max_inference_actions, max_episode_steps
+        self.actor_timeout = actor_timeout
+        self.load_model, self.save_interval = load_model, save_interval
+        self.savedir, self.xpid = savedir, xpid
+        self.checkpointpath = os.path.join(os.path.expanduser(savedir), xpid, 'model.tar')
+        self.storage_dtype = torch.int8 if is_a3 else torch.float32
+        self.frames = 0
+        self.stats = {key + str(p): 0. for p in range(self.num_players)
+                      for key in ('loss_', 'mean_episode_return_')}
+        self.actor_processes = []
         self.mean_episode_return_buf = [deque(maxlen=100) for _ in range(self.num_players)]
 
-        if cuda == "":
-            self.device_iterator = ['cpu']
-            self.training_device = "cpu"
-        else:
-            self.device_iterator = range(num_actor_devices)
+    def model_func(self, device):
+        return DMCModel(self.state_shape, self.action_shape, self.mlp_layers,
+                        self.initial_epsilon, str(device), self.share_weights,
+                        self.architecture, self.aux_classes)
 
     def _get_epsilon(self, frames):
-        """线性退火：initial_epsilon → final_epsilon"""
-        if frames >= self.epsilon_decay_frames:
-            return self.final_epsilon
-        frac = frames / self.epsilon_decay_frames
-        return self.initial_epsilon - (self.initial_epsilon - self.final_epsilon) * frac
+        fraction = min(frames / self.epsilon_decay_frames, 1.)
+        return self.initial_epsilon + fraction * (self.final_epsilon - self.initial_epsilon)
 
-    def _update_actor_epsilon(self, models, eps):
-        """更新所有 actor 模型的探索率"""
-        for model in models.values():
-            seen = set()
-            for agent in model.get_agents():
-                if id(agent) not in seen:
-                    agent.exp_epsilon = eps
-                    seen.add(id(agent))
+    def _model_spec(self):
+        return dict(state_shape=[list(s) for s in self.state_shape],
+                    action_shape=self.action_shape, mlp_layers=self.mlp_layers,
+                    architecture=self.architecture, aux_classes=list(self.aux_classes),
+                    share_weights=self.share_weights)
 
     def start(self):
-        models = {}
-        for device in self.device_iterator:
-            model = self.model_func(device)
-            model.share_memory()
-            model.eval()
-            models[device] = model
-
-        if not self.is_pettingzoo_env:
-            buffers = create_buffers(
-                self.T, self.num_buffers, self.env.state_shape,
-                self.action_shape, self.device_iterator,
-            )
-        else:
-            buffers = create_buffers_pettingzoo(
-                self.T, self.num_buffers, self.env, self.device_iterator,
-            )
-
-        actor_processes = []
-        ctx = mp.get_context('spawn')
-        free_queue = {}
-        full_queue = {}
-        for device in self.device_iterator:
-            _free_queue = [ctx.SimpleQueue() for _ in range(self.num_players)]
-            _full_queue = [ctx.SimpleQueue() for _ in range(self.num_players)]
-            free_queue[device] = _free_queue
-            full_queue[device] = _full_queue
-
-        learner_model = self.model_func(self.training_device)
-
-        # 权重共享时只需 1 个 optimizer
-        if self.share_weights and not self.is_pettingzoo_env:
-            single_opt = torch.optim.RMSprop(
-                learner_model.parameters(0),
-                lr=self.learning_rate,
-                momentum=self.momentum,
-                eps=self.epsilon,
-                alpha=self.alpha,
-            )
-            optimizers = [single_opt] * self.num_players
-
-            total_steps = self.total_frames // (self.T * self.B) + 1
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                single_opt, T_max=total_steps, eta_min=self.min_lr,
-            )
-        else:
-            optimizers = create_optimizers(
-                self.num_players, self.learning_rate,
-                self.momentum, self.epsilon, self.alpha, learner_model,
-            )
-            total_steps = self.total_frames // (self.T * self.B) + 1
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizers[0], T_max=total_steps, eta_min=self.min_lr,
-            )
-
-        stat_keys = []
-        for p in range(self.num_players):
-            stat_keys.append('mean_episode_return_'+str(p))
-            stat_keys.append('loss_'+str(p))
-        stat_keys.extend(['epsilon', 'lr'])
-        frames, stats = 0, {k: 0 for k in stat_keys}
-
-        if self.load_model and os.path.exists(self.checkpointpath):
-            checkpoint_states = torch.load(
-                self.checkpointpath,
-                map_location="cuda:"+str(self.training_device) if self.training_device != "cpu" else "cpu"
-            )
+        torch.manual_seed(self.seed)
+        learner = self.model_func(self.training_device)
+        optimizers = create_optimizers(self.num_players, self.learning_rate, self.momentum,
+                                      self.epsilon, self.alpha, learner)
+        unique_opts = list({id(o): o for o in optimizers}.values())
+        schedulers = [FrameScheduler(o, self.learning_rate, self.min_lr,
+                                     self.total_frames, self.T * self.B) for o in unique_opts]
+        self.frames = 0
+        if self.load_model:
+            if not os.path.isfile(self.checkpointpath):
+                raise FileNotFoundError(self.checkpointpath)
+            state = torch.load(self.checkpointpath, map_location='cpu', weights_only=False)
+            if 'model_spec' in state and state['model_spec'] != self._model_spec():
+                raise ValueError('Checkpoint model specification does not match this run')
+            if bool(state.get('share_weights', False)) != self.share_weights:
+                raise ValueError('Checkpoint weight sharing does not match this run')
+            if len(state['model_state_dict']) != self.num_players:
+                raise ValueError('Checkpoint role count does not match this run')
             for p in range(self.num_players):
-                learner_model.get_agent(p).load_state_dict(checkpoint_states["model_state_dict"][p])
-                for device in self.device_iterator:
-                    models[device].get_agent(p).load_state_dict(learner_model.get_agent(p).state_dict())
-            if not self.share_weights:
-                for p in range(self.num_players):
-                    optimizers[p].load_state_dict(checkpoint_states["optimizer_state_dict"][p])
-            else:
-                optimizers[0].load_state_dict(checkpoint_states["optimizer_state_dict"][0])
-            stats.update(checkpoint_states.get("stats", {}))
-            frames = checkpoint_states.get("frames", 0)
-            log.info(f"Resuming preempted job at frame {frames:,}")
-
+                learner.get_agent(p).load_state_dict(state['model_state_dict'][p])
+                optimizers[p].load_state_dict(state['optimizer_state_dict'][p])
+            self.frames = state['frames']
+            self.stats = state.get('stats', {})
+            for scheduler, saved in zip(schedulers, state.get('scheduler_state_dicts', [])):
+                scheduler.load_state_dict(saved)
+            for scheduler in schedulers:
+                scheduler.step(self.frames)
+        ctx = mp.get_context('spawn')
+        stop = ctx.Event()
+        exploration = ctx.Value('d', self._get_epsilon(self.frames))
+        errors = ctx.Queue()
+        buffers = create_buffers(self.T, self.num_buffers, self.state_shape, self.action_shape,
+                                 self.device_iterator, len(self.aux_classes), self.storage_dtype)
+        models, locks, free, full = {}, {}, {}, {}
+        readers, counters = [], []
         for device in self.device_iterator:
-            for i in range(self.num_actors):
-                if self.vectorized and not self.is_pettingzoo_env:
-                    actor = ctx.Process(
-                        target=act_vectorized,
-                        args=(i, device, self.T,
-                              free_queue[device], full_queue[device],
-                              models[device], buffers[device],
-                              self.envs_per_actor, self.env_config))
-                else:
-                    actor = ctx.Process(
-                        target=act_pettingzoo if self.is_pettingzoo_env else act,
-                        args=(i, device, self.T,
-                              free_queue[device], full_queue[device],
-                              models[device], buffers[device], self.env))
-                actor.start()
-                actor_processes.append(actor)
+            models[device] = self.model_func(device)
+            models[device].share_memory()
+            models[device].eval()
+            locks[device] = ctx.Lock()
+            free[device] = [ctx.Queue(maxsize=self.num_buffers) for _ in range(self.num_players)]
+            full[device] = [ctx.Queue(maxsize=self.num_buffers) for _ in range(self.num_players)]
+            for p in range(self.num_players):
+                models[device].get_agent(p).load_state_dict(learner.get_agent(p).state_dict())
+                for i in range(self.num_buffers):
+                    free[device][p].put(i)
+                readers.append((device, p, BatchReader(free[device][p], full[device][p],
+                                                       buffers[device][p], self.B)))
+            if device != 'cpu':
+                torch.cuda.synchronize(device)
+        self.plogger = FileWriter(self.xpid, xp_args=dict(
+            model=self._model_spec(), backend=self.backend, seed=self.seed,
+            batch_size=self.B, unroll_length=self.T, envs_per_actor=self.envs_per_actor,
+            num_actors=self.num_actors, actor_devices=self.device_iterator,
+            training_device=self.training_device, weight_sync_interval=self.weight_sync_interval),
+            rootdir=self.savedir)
+        self.actor_processes = []
+        updates = self.frames // (self.T * self.B)
+        successful = False
+        last_checkpoint = last_log = last_batch = time.monotonic()
+        start_time, start_frames = last_log, self.frames
+        loss_totals = [[] for _ in range(self.num_players)]
 
-        # 权重共享时所有位置用同一把锁
-        if self.share_weights and not self.is_pettingzoo_env:
-            shared_position_lock = threading.Lock()
-            position_locks = [shared_position_lock] * self.num_players
-        else:
-            position_locks = [threading.Lock() for _ in range(self.num_players)]
+        def sync_models():
+            for device, model in models.items():
+                with locks[device]:
+                    for p in ([0] if self.share_weights else range(self.num_players)):
+                        model.get_agent(p).load_state_dict(learner.get_agent(p).state_dict())
+                    if device != 'cpu':
+                        torch.cuda.synchronize(device)
 
-        def batch_and_learn(i, device, position, local_lock, position_lock, lock=threading.Lock()):
-            nonlocal frames, stats
-            while frames < self.total_frames:
-                batch = get_batch(
-                    free_queue[device][position],
-                    full_queue[device][position],
-                    buffers[device][position],
-                    self.B, local_lock
-                )
-                loss_val = learn(
-                    position, models,
-                    learner_model.get_agent(position),
-                    batch, optimizers[position],
-                    self.training_device, self.max_grad_norm,
-                    self.mean_episode_return_buf, position_lock
-                )
+        def checkpoint():
+            payload = dict(model_state_dict=[a.state_dict() for a in learner.get_agents()],
+                           optimizer_state_dict=[o.state_dict() for o in optimizers],
+                           scheduler_state_dicts=[s.state_dict() for s in schedulers],
+                           frames=self.frames, stats=self.stats, share_weights=self.share_weights,
+                           model_spec=self._model_spec(), seed=self.seed)
+            temporary = self.checkpointpath + '.tmp'
+            torch.save(payload, temporary)
+            os.replace(temporary, self.checkpointpath)
 
-                with lock:
-                    stats['loss_'+str(position)] = loss_val.item()
-                    buf = self.mean_episode_return_buf[position]
-                    if len(buf) > 0:
-                        stats['mean_episode_return_'+str(position)] = torch.mean(
-                            torch.stack(list(buf))).item()
-
-                    if self.share_weights and position == 0:
-                        scheduler.step()
-
-                    to_log = dict(frames=frames)
-                    to_log.update({k: stats[k] for k in stat_keys})
-                    self.plogger.log(to_log)
-                    frames += self.T * self.B
-
-        for device in self.device_iterator:
-            for m in range(self.num_buffers):
-                for p in range(self.num_players):
-                    free_queue[device][p].put(m)
-
-        threads = []
-
-        if self.share_weights and not self.is_pettingzoo_env:
-            weight_sync_interval = 50
-
-            def aggregated_learner(stats_lock=threading.Lock()):
-                nonlocal frames, stats
-                pairs = [(d, p) for d in self.device_iterator
-                         for p in range(self.num_players)]
-                step_count = 0
-                _diag_t = time.time()
-                _diag_trained = 0
-                _diag_skipped = 0
-                _diag_get_ms = 0.0
-                _diag_learn_ms = 0.0
-                _loss_accum = {p: [] for p in range(self.num_players)}
-                _stats_interval = 50
-
-                while frames < self.total_frames:
-                    trained_any = False
-                    for device, position in pairs:
-                        _gt0 = time.time()
-                        batch = get_batch_nonblocking(
-                            free_queue[device][position],
-                            full_queue[device][position],
-                            buffers[device][position],
-                            self.B,
-                        )
-                        _gt1 = time.time()
-                        _diag_get_ms += (_gt1 - _gt0) * 1000
-
-                        if batch is None:
-                            _diag_skipped += 1
-                            continue
-
-                        do_sync = (step_count % weight_sync_interval == 0)
-                        _lt0 = time.time()
-                        loss_val = learn(
-                            position, models,
-                            learner_model.get_agent(position),
-                            batch, optimizers[position],
-                            self.training_device, self.max_grad_norm,
-                            self.mean_episode_return_buf,
-                            lock=None,
-                            sync_weights=do_sync,
-                        )
-                        _lt1 = time.time()
-                        _diag_learn_ms += (_lt1 - _lt0) * 1000
-                        step_count += 1
-                        _diag_trained += 1
-                        trained_any = True
-                        _loss_accum[position].append(loss_val)
-
-                        do_stats = (step_count % _stats_interval == 0)
-                        with stats_lock:
-                            if do_stats:
-                                for p in range(self.num_players):
-                                    if _loss_accum[p]:
-                                        stats['loss_'+str(p)] = torch.stack(_loss_accum[p]).mean().item()
-                                        _loss_accum[p] = []
-                                    buf = self.mean_episode_return_buf[p]
-                                    if len(buf) > 0:
-                                        stats['mean_episode_return_'+str(p)] = torch.mean(
-                                            torch.stack(list(buf))).item()
-                            if position == 0:
-                                scheduler.step()
-                            frames += self.T * self.B
-                            if do_stats:
-                                to_log = dict(frames=frames)
-                                to_log.update({k: stats[k] for k in stat_keys})
-                                self.plogger.log(to_log)
-
-                    if not trained_any:
-                        time.sleep(0.001)
-
-                    if time.time() - _diag_t > 30.0 and _diag_trained > 0:
-                        log.info(
-                            'Learner diag: trained=%d skipped=%d | '
-                            'get_avg=%.2fms learn_avg=%.2fms | '
-                            'batches/sec=%.1f',
-                            _diag_trained, _diag_skipped,
-                            _diag_get_ms / _diag_trained,
-                            _diag_learn_ms / _diag_trained,
-                            _diag_trained / (time.time() - _diag_t))
-                        _diag_t = time.time()
-                        _diag_trained = _diag_skipped = 0
-                        _diag_get_ms = _diag_learn_ms = 0.0
-
-            thread = threading.Thread(
-                target=aggregated_learner,
-                name='aggregated-learner',
-            )
-            thread.start()
-            threads.append(thread)
-        else:
-            locks = {device: [threading.Lock() for _ in range(self.num_players)]
-                     for device in self.device_iterator}
-            for device in self.device_iterator:
-                for i in range(self.num_threads):
-                    for position in range(self.num_players):
-                        thread = threading.Thread(
-                            target=batch_and_learn,
-                            name='batch-and-learn-%d' % i,
-                            args=(i, device, position,
-                                  locks[device][position],
-                                  position_locks[position]))
-                        thread.start()
-                        threads.append(thread)
-
-        def checkpoint(frames):
-            log.info('Saving checkpoint to %s', self.checkpointpath)
-            _agents = learner_model.get_agents()
-            seen = set()
-            model_dicts = []
-            for a in _agents:
-                model_dicts.append(a.state_dict())
-                seen.add(id(a))
-
-            opt_dicts = []
-            seen_opt = set()
-            for o in optimizers:
-                if id(o) not in seen_opt:
-                    opt_dicts.append(o.state_dict())
-                    seen_opt.add(id(o))
-                else:
-                    opt_dicts.append(opt_dicts[0])
-
-            torch.save({
-                'model_state_dict': model_dicts,
-                'optimizer_state_dict': opt_dicts,
-                'stats': stats,
-                'frames': frames,
-                'share_weights': self.share_weights,
-            }, self.checkpointpath)
-
-        timer = timeit.default_timer
         try:
-            last_checkpoint_time = timer() - self.save_interval * 60
-            while frames < self.total_frames:
-                start_frames = frames
-                start_time = timer()
-                time.sleep(5)
-
-                # Epsilon 退火
-                new_eps = self._get_epsilon(frames)
-                self._update_actor_epsilon(models, new_eps)
-                stats['epsilon'] = new_eps
-                current_lr = optimizers[0].param_groups[0]['lr']
-                stats['lr'] = current_lr
-
-                if timer() - last_checkpoint_time > self.save_interval * 60:
-                    checkpoint(frames)
-                    last_checkpoint_time = timer()
-
-                end_time = timer()
-                fps = (frames - start_frames) / (end_time - start_time)
-                log.info(
-                    'After %i (%.1fM) frames: @ %.1f fps | eps=%.3f lr=%.2e | Stats:\n%s',
-                    frames, frames / 1e6, fps, new_eps, current_lr,
-                    pprint.pformat({k: v for k, v in stats.items() if not k.startswith('epsilon') and not k.startswith('lr')}),
-                )
+            if self.frames < self.total_frames:
+                for device in self.device_iterator:
+                    for _ in range(self.num_actors):
+                        actor_id = len(self.actor_processes)
+                        actor_seed = int(np.random.SeedSequence([self.seed, actor_id]).generate_state(1)[0])
+                        actor_seed %= 2**32 - self.envs_per_actor
+                        counter = ctx.Array('q', 2)
+                        counters.append(counter)
+                        actor = ctx.Process(target=actor_worker, name='dmc-actor-%d' % actor_id,
+                            args=(actor_id, actor_seed, self.env_source, models[device], locks[device],
+                                  buffers[device], free[device], full[device], stop, exploration,
+                                  errors, counter, self.T, self.envs_per_actor, self.backend,
+                                  self.adapter_class, self.max_inference_actions, self.max_episode_steps))
+                        actor.start()
+                        self.actor_processes.append(actor)
+            while self.frames < self.total_frames:
+                try:
+                    actor_id, detail = errors.get_nowait()
+                    raise RuntimeError('Actor %d failed:\n%s' % (actor_id, detail))
+                except Empty:
+                    pass
+                for actor in self.actor_processes:
+                    if actor.exitcode is not None:
+                        raise RuntimeError('%s exited unexpectedly (%s)' % (actor.name, actor.exitcode))
+                trained = False
+                for device, p, reader in readers:
+                    if self.frames >= self.total_frames:
+                        break
+                    batch = reader.get()
+                    if batch is None:
+                        continue
+                    loss = learn(p, {}, learner.get_agent(p), batch, optimizers[p],
+                                 self.training_device, self.max_grad_norm,
+                                 self.mean_episode_return_buf, sync_weights=False)
+                    loss_totals[p].append(loss)
+                    self.frames += self.T * self.B
+                    updates += 1
+                    for scheduler in schedulers:
+                        scheduler.step(self.frames)
+                    exploration.value = self._get_epsilon(self.frames)
+                    if updates % self.weight_sync_interval == 0:
+                        sync_models()
+                    trained = True
+                    last_batch = time.monotonic()
+                    if updates % self.stats_interval == 0:
+                        self._record_stats(loss_totals, counters, updates, exploration.value,
+                                           optimizers[0].param_groups[0]['lr'], start_time, start_frames)
+                if not trained:
+                    stop.wait(.002)
+                now = time.monotonic()
+                if now - last_batch > self.actor_timeout:
+                    raise TimeoutError('No training batch within actor_timeout; check actor supply and batch size')
+                if now - last_checkpoint >= self.save_interval * 60:
+                    checkpoint()
+                    last_checkpoint = now
+                if now - last_log >= 5:
+                    log.info('Trained %d samples (%.0f samples/s)', self.frames,
+                             (self.frames - start_frames) / (now - start_time))
+                    last_log = now
+            successful = True
         except KeyboardInterrupt:
-            return
-        else:
-            for thread in threads:
-                thread.join()
-            log.info('Learning finished after %d frames.', frames)
+            log.info('Stopping training and saving checkpoint')
+        finally:
+            stop.set()
+            deadline = time.monotonic() + 5
+            for actor in self.actor_processes:
+                actor.join(timeout=max(0, deadline - time.monotonic()))
+            for actor in self.actor_processes:
+                if actor.is_alive():
+                    actor.terminate()
+                    actor.join(timeout=5)
+            self._record_stats(loss_totals, counters, updates, exploration.value,
+                               optimizers[0].param_groups[0]['lr'], start_time, start_frames)
+            checkpoint()
+            for queues in (free, full):
+                for group in queues.values():
+                    for q in group:
+                        q.cancel_join_thread()
+                        q.close()
+            errors.close()
+            self.plogger.close(successful=successful)
+        return self.stats
 
-        checkpoint(frames)
-        self.plogger.close()
+    def _record_stats(self, losses, counters, updates, exploration, lr, start_time, start_frames):
+        self.stats.update(frames=self.frames, learner_updates=updates, epsilon=exploration, lr=lr,
+                          training_samples_per_second=(self.frames - start_frames) /
+                          max(time.monotonic() - start_time, 1e-9),
+                          actor_steps=sum(c[0] for c in counters),
+                          episodes=sum(c[1] for c in counters))
+        for p in range(self.num_players):
+            if losses[p]:
+                self.stats['loss_%d' % p] = torch.stack(losses[p]).mean().item()
+                losses[p].clear()
+            returns = self.mean_episode_return_buf[p]
+            if returns:
+                self.stats['mean_episode_return_%d' % p] = float(np.mean(returns))
+        self.plogger.log(dict(self.stats))

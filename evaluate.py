@@ -42,6 +42,8 @@ def load_dmc_agents(model_path, env):
         env.action_shape,
         exp_epsilon=0.0,  # 评估时不探索
         device='cpu',
+        architecture='resnet',
+        aux_classes=(3, 3, 3),
     )
 
     if os.path.exists(model_path):

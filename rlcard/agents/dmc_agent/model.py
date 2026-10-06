@@ -41,10 +41,31 @@ class DMCNet(nn.Module):
         self,
         state_shape,
         action_shape,
-        mlp_layers=[512, 512, 512, 512, 512]
+        mlp_layers=[512, 512, 512, 512, 512],
+        architecture='mlp',
+        aux_classes=(),
     ):
         super().__init__()
         input_dim = int(np.prod(state_shape) + np.prod(action_shape))
+        if not mlp_layers or any(d <= 0 for d in mlp_layers):
+            raise ValueError('mlp_layers must contain positive widths')
+        if architecture not in ('mlp', 'resnet'):
+            raise ValueError('architecture must be mlp or resnet')
+        self.architecture = architecture
+        self.aux_classes = tuple(aux_classes)
+        if architecture == 'resnet' and len(set(mlp_layers)) != 1:
+            raise ValueError('Residual block widths must be identical')
+        if any(n <= 0 for n in aux_classes):
+            raise ValueError('Auxiliary class counts must be positive')
+        if architecture == 'mlp':
+            layers = []
+            for left, right in zip([input_dim] + list(mlp_layers), mlp_layers):
+                layers.extend([nn.Linear(left, right), nn.ReLU()])
+            layers.append(nn.Linear(mlp_layers[-1], 1))
+            self.fc_layers = nn.Sequential(*layers)
+            if aux_classes:
+                raise ValueError('Auxiliary heads require architecture=resnet')
+            return
         hidden = mlp_layers[0]
 
         self.input_proj = nn.Sequential(
@@ -61,7 +82,7 @@ class DMCNet(nn.Module):
 
         # 辅助任务头：预测其他 3 个玩家的队伍（相对位置）
         # 每人 3 类: SPADE_A3=0, OPPONENT=1, SOLO=2 → 共 9 个 logits
-        self.aux_head = nn.Linear(hidden, 9)
+        self.aux_head = nn.Linear(hidden, sum(aux_classes)) if aux_classes else None
 
     def _backbone(self, obs, actions):
         obs = torch.flatten(obs, 1)
@@ -73,14 +94,18 @@ class DMCNet(nn.Module):
 
     def forward(self, obs, actions):
         """Q 值输出（推理 / ONNX 导出用，不走 aux_head）"""
+        if self.architecture == 'mlp':
+            return self.fc_layers(torch.cat((obs.flatten(1), actions.flatten(1)), 1)).flatten()
         x = self._backbone(obs, actions)
         return self.output_head(x).flatten()
 
     def forward_with_aux(self, obs, actions):
         """训练用：同时返回 Q 值和辅助预测 logits"""
+        if self.architecture == 'mlp':
+            return self.forward(obs, actions), None
         x = self._backbone(obs, actions)
         q = self.output_head(x).flatten()
-        aux = self.aux_head(x)          # (batch, 9)
+        aux = self.aux_head(x) if self.aux_head is not None else None
         return q, aux
 
 
@@ -92,10 +117,12 @@ class DMCAgent:
         mlp_layers=[512, 512, 512, 512, 512],
         exp_epsilon=0.01,
         device="0",
+        architecture='mlp',
+        aux_classes=(),
     ):
         self.use_raw = False
         self.device = 'cuda:' + device if device != "cpu" else "cpu"
-        self.net = DMCNet(state_shape, action_shape, mlp_layers).to(self.device)
+        self.net = DMCNet(state_shape, action_shape, mlp_layers, architecture, aux_classes).to(self.device)
         self.exp_epsilon = exp_epsilon
         self.action_shape = action_shape
 
@@ -113,7 +140,8 @@ class DMCAgent:
         action_idx = np.argmax(values)
         action = action_keys[action_idx]
         info = {}
-        info['values'] = {state['raw_legal_actions'][i]: float(values[i]) for i in range(len(action_keys))}
+        labels = state.get('raw_legal_actions', action_keys)
+        info['values'] = {labels[i]: float(values[i]) for i in range(len(action_keys))}
         return action, info
 
     def share_memory(self):
@@ -125,6 +153,7 @@ class DMCAgent:
     def parameters(self):
         return self.net.parameters()
 
+    @torch.no_grad()
     def predict(self, state):
         obs = state['obs'].astype(np.float32)
         legal_actions = state['legal_actions']
@@ -157,11 +186,7 @@ class DMCAgent:
 
 
 class DMCModel:
-    """DMC 模型容器。
-
-    share_weights=True（默认）时，4 个位置共享同一个网络——
-    A3 地主是位置对称的，无需为每个座位单独训练。
-    """
+    """Per-role policies, with explicit optional weight sharing."""
     def __init__(
         self,
         state_shape,
@@ -169,15 +194,21 @@ class DMCModel:
         mlp_layers=[512, 512, 512, 512, 512],
         exp_epsilon=0.01,
         device=0,
-        share_weights=True,
+        share_weights=False,
+        architecture='mlp',
+        aux_classes=(),
     ):
         self.shared = share_weights
         num_players = len(state_shape)
+        if share_weights and (any(tuple(s) != tuple(state_shape[0]) for s in state_shape)
+                              or any(tuple(s) != tuple(action_shape[0]) for s in action_shape)):
+            raise ValueError('Shared policies require identical observation and action shapes')
 
         if share_weights:
             agent = DMCAgent(
                 state_shape[0], action_shape[0],
                 mlp_layers, exp_epsilon, str(device),
+                architecture, aux_classes,
             )
             self.agents = [agent for _ in range(num_players)]
         else:
@@ -186,6 +217,7 @@ class DMCModel:
                 self.agents.append(DMCAgent(
                     state_shape[pid], action_shape[pid],
                     mlp_layers, exp_epsilon, str(device),
+                    architecture, aux_classes,
                 ))
 
     def share_memory(self):

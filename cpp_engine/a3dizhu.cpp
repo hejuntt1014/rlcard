@@ -1339,6 +1339,7 @@ VectorizedEngine::advance_to_decision(int idx) {
         engines_[idx].encode_obs(pid, sd.obs);
 
         std::string key = engines_[idx].get_rule_agent_action();
+        engines_[idx].get_action_feature(key, sd.action);
         engines_[idx].step(key);
         steps.push_back(sd);
     }

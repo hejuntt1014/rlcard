@@ -154,6 +154,20 @@ PYBIND11_MODULE(a3dizhu_cpp, m) {
             return py::make_tuple(done, obs, py::cast(pids));
         }, py::arg("idx"))
 
+        .def("advance_to_decision_with_actions", [](VectorizedEngine& v, int idx) {
+            auto [done, steps] = v.advance_to_decision(idx);
+            int n = (int)steps.size();
+            py::array_t<int8_t> obs({n, (int)STATE_DIM});
+            py::array_t<int8_t> actions({n, (int)ACTION_DIM});
+            std::vector<int> pids(n);
+            for (int i = 0; i < n; i++) {
+                std::memcpy(obs.mutable_data() + i * STATE_DIM, steps[i].obs, STATE_DIM);
+                std::memcpy(actions.mutable_data() + i * ACTION_DIM, steps[i].action, ACTION_DIM);
+                pids[i] = steps[i].player_id;
+            }
+            return py::make_tuple(done, obs, py::cast(pids), actions);
+        }, py::arg("idx"))
+
         // Batch-prepare data for GPU inference across multiple envs.
         // Returns (obs_expanded[T,850], action_flat[T,52],
         //          obs_raw[K,850], offsets[K+1], action_keys)

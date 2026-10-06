@@ -119,7 +119,6 @@ elapsed = time.time() - t0
 fps = total_steps / elapsed
 print(f"  ✓ 1000 games, {total_steps} total steps in {elapsed:.2f}s")
 print(f"  ✓ Throughput: {fps:.0f} steps/sec (single-threaded C++)")
-print(f"    vs Python baseline ~100-300 steps/sec → {fps/200:.1f}x speedup estimate")
 
 # ─── Test 5: Rule agent ───
 print("\nTest 5: Rule agent integration")
