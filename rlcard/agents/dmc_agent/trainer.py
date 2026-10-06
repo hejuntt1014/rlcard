@@ -1,3 +1,5 @@
+# Modifications copyright (c) 2026 hejuntt1014.
+# Modified for batched training, optional backends, and runtime portability.
 # Copyright 2021 RLCard Team of Texas A&M University
 # Copyright 2021 DouZero Team of Kwai
 #

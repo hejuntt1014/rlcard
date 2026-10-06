@@ -1,3 +1,5 @@
+# Modifications copyright (c) 2026 hejuntt1014.
+# Modified for batched training, optional backends, and runtime portability.
 # Copyright (c) Facebook, Inc. and its affiliates.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
