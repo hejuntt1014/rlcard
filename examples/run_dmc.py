@@ -39,6 +39,7 @@ def train(args):
         auxiliary=args.auxiliary,
         mlp_layers=args.hidden_sizes,
         weight_sync_interval=args.weight_sync_interval,
+        actor_on_cpu=args.actor_on_cpu,
     )
 
     # Train DMC Agents
@@ -120,6 +121,7 @@ if __name__ == '__main__':
     parser.add_argument('--hidden_sizes', type=int, nargs='+', default=[512] * 5)
     parser.add_argument('--weight_sync_interval', type=int, default=50)
     parser.add_argument('--cpu_threads', type=int, default=1)
+    parser.add_argument('--actor_on_cpu', action='store_true')
     args = parser.parse_args()
     torch.set_num_threads(args.cpu_threads)
 

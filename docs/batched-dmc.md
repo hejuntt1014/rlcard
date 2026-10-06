@@ -46,6 +46,17 @@ Device indices refer to the devices listed in `--cuda`. Actors use the first
 run both roles. Environment simulation runs on the CPU. This is actor/learner
 parallelism, not distributed data-parallel optimization.
 
+For a GPU with 8 GB of memory, start with CPU actors and a small learner batch:
+
+```bash
+python -m examples.run_dmc --env leduc-holdem --cuda 0 --training_device 0 --actor_on_cpu --num_actors 2 --envs_per_actor 8 --batch_size 16 --unroll_length 20 --num_buffers 64 --hidden_sizes 128 128 --total_frames 100000 --xpid single_gpu
+```
+
+`--actor_on_cpu` keeps actor models and inference on the CPU, so only the learner
+uses GPU memory. Increase the batch and model sizes after measuring peak memory
+on the target hardware. Free GPU memory, not the card's nominal capacity,
+determines the usable batch size.
+
 ## A3 native training
 
 ```bash
@@ -96,6 +107,7 @@ are not accepted by this adapter.
 | `auxiliary` | Optional A3 classification targets; use `False` with an A3 MLP |
 | `vectorized` | When false, use one environment per actor |
 | `envs_per_actor` | Number of games managed by one process |
+| `actor_on_cpu` | Keep actors on the CPU while training on the selected GPU |
 | `batch_size` | Number of unroll blocks in a learner batch |
 | `unroll_length` | Number of decision samples per block |
 | `num_buffers` | Slots per actor device and role; must be at least `batch_size` |

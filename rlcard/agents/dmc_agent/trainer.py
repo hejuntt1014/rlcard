@@ -124,7 +124,7 @@ class DMCTrainer:
                  architecture=None, mlp_layers=None, auxiliary=None,
                  weight_sync_interval=50, stats_interval=50,
                  max_inference_actions=4096, max_episode_steps=10000,
-                 actor_timeout=120, adapter_class=None, env_factory=None):
+                 actor_timeout=120, adapter_class=None, env_factory=None, actor_on_cpu=False):
         positive = dict(batch_size=batch_size, unroll_length=unroll_length,
                         num_buffers=num_buffers, num_actors=num_actors,
                         num_actor_devices=num_actor_devices, envs_per_actor=envs_per_actor,
@@ -191,11 +191,11 @@ class DMCTrainer:
             os.environ['CUDA_VISIBLE_DEVICES'] = cuda
             if not torch.cuda.is_available():
                 raise ValueError('CUDA requested but unavailable')
-            if num_actor_devices > torch.cuda.device_count():
+            if not actor_on_cpu and num_actor_devices > torch.cuda.device_count():
                 raise ValueError('num_actor_devices exceeds visible CUDA devices')
             if training_device != 'cpu' and not 0 <= int(training_device) < torch.cuda.device_count():
                 raise ValueError('training_device is not a visible CUDA device')
-            self.device_iterator = list(range(num_actor_devices))
+            self.device_iterator = ['cpu'] if actor_on_cpu else list(range(num_actor_devices))
             self.training_device = str(training_device)
         else:
             self.device_iterator = ['cpu']

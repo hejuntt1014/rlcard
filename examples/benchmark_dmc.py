@@ -22,6 +22,7 @@ def main():
     parser.add_argument('--backend', choices=['auto', 'python', 'cpp'], default='python')
     parser.add_argument('--cuda', default='')
     parser.add_argument('--training_device', default='0')
+    parser.add_argument('--actor_on_cpu', action='store_true')
     parser.add_argument('--output', default='experiments/benchmark/results.json')
     args = parser.parse_args()
     torch.set_num_threads(1)
@@ -39,6 +40,7 @@ def main():
                 config['backend'] = args.backend
             env = rlcard.make(args.env, config=config)
             trainer = DMCTrainer(env, cuda=args.cuda, training_device=args.training_device,
+                actor_on_cpu=args.actor_on_cpu,
                 backend=args.backend, num_actors=args.num_actors, envs_per_actor=count,
                 total_frames=args.total_frames, batch_size=args.batch_size,
                 unroll_length=args.unroll_length, num_buffers=max(32, args.batch_size * 2),
